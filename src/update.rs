@@ -42,6 +42,19 @@ pub fn watch(ctx: eframe::egui::Context) -> (mpsc::Receiver<Update>, mpsc::Sende
     (receiver, opened_tx)
 }
 
+/// Opens the newest installer, checking GitHub again so a release published
+/// since the last check isn't missed. Falls back to `known` if the check fails.
+pub fn open_latest(known: &Update) {
+    let fallback = known.url();
+    std::thread::spawn(move || {
+        let url = check().map_or(fallback, |latest| latest.url());
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        crate::win::shell_open(&url, "open", None);
+    });
+}
+
 fn check() -> Option<Update> {
     let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
         $ErrorActionPreference = 'Stop'; \

@@ -630,9 +630,8 @@ impl Lumen {
                     .inner
                     .on_hover_text(format!("Download Lumen {}", release.version));
                 if response.clicked() {
-                    let url = release.url();
+                    crate::update::open_latest(release);
                     self.hide();
-                    win::shell_open(&url, "open", None);
                 }
             } else if let Some(status) = status {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
