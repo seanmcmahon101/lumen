@@ -12,6 +12,14 @@ profile and adds a Start menu shortcut. It requires no administrator rights.
 Start Lumen and press **Win+Space** to search. To have it open at login, search
 for **Start Lumen at login** in Lumen and press Enter.
 
+On multiple monitors, Lumen opens in the centre of the active app's display and
+dims the others until you close it. When the desktop has focus, Lumen uses the
+display under the pointer.
+
+Lumen checks GitHub for a newer installer at startup and every six hours. When
+**Update available** appears, click it to open the release page and download
+the installer.
+
 For an update or uninstall, first search for **Quit Lumen** and press Enter.
 Run the new installer to update, or remove Lumen from **Settings → Apps**.
 

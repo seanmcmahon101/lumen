@@ -5,6 +5,7 @@ mod calc;
 mod hook;
 mod index;
 mod mail;
+mod update;
 mod win;
 
 use eframe::egui;

@@ -88,6 +88,9 @@ pub struct Lumen {
     startup: bool,
     profile: String,
     backdrop: Option<TextureHandle>,
+    display_overlay: win::DisplayOverlay,
+    update_rx: mpsc::Receiver<crate::update::Update>,
+    available_update: Option<crate::update::Update>,
     pinned: bool, // --show: stay open when focus leaves (testing)
     frames: u32,
     search_tx: mpsc::Sender<(String, u64, win::History)>,
@@ -211,6 +214,9 @@ impl Lumen {
             startup: win::startup_enabled(),
             profile: std::env::var("USERPROFILE").unwrap_or_default(),
             backdrop: None,
+            display_overlay: win::DisplayOverlay::default(),
+            update_rx: crate::update::watch(ctx.clone()),
+            available_update: None,
             pinned,
             frames: 0,
             search_tx,
@@ -244,13 +250,18 @@ impl Lumen {
     }
 
     fn hide(&mut self) {
+        self.display_overlay.close();
         win::hide();
     }
 
     fn refresh(&mut self) {
         let same_query = self.search_key.as_ref().is_some_and(|(query, _)| query == &self.query);
-        let previous_selection = (same_query && self.selection_by_user).then(|| self.results.get(self.selected).map(|item| (item.title.clone(), item.subtitle.clone()))).flatten();
-        if !same_query { self.selection_by_user = false; }
+        let previous_selection = (same_query && self.selection_by_user)
+            .then(|| self.results.get(self.selected).map(|item| (item.title.clone(), item.subtitle.clone())))
+            .flatten();
+        if !same_query {
+            self.selection_by_user = false;
+        }
         self.last_query = Some(self.query.clone());
         self.last_generation = self.index.generation();
         self.results.clear();
@@ -500,7 +511,12 @@ impl Lumen {
         let screen = ui.max_rect();
         let painter = ui.painter().clone();
         match &self.backdrop {
-            Some(tex) => painter.image(tex.id(), screen, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::from_gray(76)),
+            Some(tex) => painter.image(
+                tex.id(),
+                screen,
+                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                Color32::from_gray(win::BACKDROP_BRIGHTNESS),
+            ),
             None => painter.rect_filled(screen, 0, Color32::from_gray(24)),
         };
 
@@ -511,8 +527,7 @@ impl Lumen {
         let first_row = self.selected.saturating_sub(rows.saturating_sub(1));
         let w = WIDTH.min(screen.width() - 40.0);
         let h = BAR_H + FILTER_H + if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 48.0 };
-        let top = (screen.top() + screen.height() * 0.22).min(screen.bottom() - h - 16.0).max(screen.top() + 16.0);
-        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, top), vec2(w, h));
+        let panel = Rect::from_center_size(screen.center(), vec2(w, h));
 
         // Click on the dimmed area closes.
         if ui.interact(screen, Id::unique("dim"), Sense::click()).clicked()
@@ -585,7 +600,17 @@ impl Lumen {
             } else {
                 None
             };
-            if let Some(status) = status {
+            if let Some(release) = &self.available_update {
+                let response = ui
+                    .with_layout(Layout::right_to_left(Align::Center), |ui| ui.link(RichText::new("Update available").size(14.0)))
+                    .inner
+                    .on_hover_text(format!("View Lumen {} on GitHub", release.version));
+                if response.clicked() {
+                    let url = release.release_url();
+                    self.hide();
+                    win::shell_open(&url, "open", None);
+                }
+            } else if let Some(status) = status {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(status).size(14.0).color(SUBTLE));
                 });
@@ -653,8 +678,12 @@ impl Lumen {
             let selected = self.results.get(self.selected);
             let copy_action = selected.is_some_and(|item| matches!(item.action, Action::Copy(_)));
             let mut hints = vec![("Enter", if copy_action { "Copy answer" } else { "Open" })];
-            if selected.is_some_and(|item| item.reveal.is_some()) { hints.push(("Ctrl+Enter", "Show in folder")); }
-            if selected.is_some_and(|item| item.complete.is_some()) { hints.push(("Tab", "Complete")); }
+            if selected.is_some_and(|item| item.reveal.is_some()) {
+                hints.push(("Ctrl+Enter", "Show in folder"));
+            }
+            if selected.is_some_and(|item| item.complete.is_some()) {
+                hints.push(("Tab", "Complete"));
+            }
             hints.push(("Esc", "Close"));
             hints
         };
@@ -683,9 +712,18 @@ impl eframe::App for Lumen {
         } else if self.frames == 2 && !win::VISIBLE.load(Ordering::Relaxed) {
             win::hide();
         }
-        if win::JUST_SHOWN.swap(false, Ordering::Relaxed) {
-            unsafe { win::fit_to_cursor_monitor(false) };
-            self.backdrop = win::BACKDROP.lock().unwrap().take().map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
+        if !win::VISIBLE.load(Ordering::Relaxed) {
+            self.display_overlay.close();
+            return;
+        }
+        if win::JUST_SHOWN.swap(false, Ordering::Acquire) {
+            self.backdrop = self.display_overlay.open().map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
+            if !win::VISIBLE.load(Ordering::Relaxed) {
+                self.hide();
+                return;
+            }
+            win::show_native();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             win::force_foreground();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.seen_focus = false;
@@ -693,9 +731,14 @@ impl eframe::App for Lumen {
             self.set_cursor(ctx, had_text);
             ctx.memory_mut(|m| m.request_focus(Self::query_id()));
             self.last_query = None;
+            ctx.request_repaint();
+        } else {
+            // A DPI change can resize the native window after the initial move.
+            self.display_overlay.fit();
         }
-        if !win::VISIBLE.load(Ordering::Relaxed) {
-            return;
+
+        while let Ok(update) = self.update_rx.try_recv() {
+            self.available_update = Some(update);
         }
 
         while let Ok((q, generation, found, note)) = self.search_rx.try_recv() {

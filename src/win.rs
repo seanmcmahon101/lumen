@@ -2,27 +2,32 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use windows::Win32::Foundation::{HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
-    DeleteDC, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, GetStockObject, HBRUSH, HDC, HGDIOBJ,
+    HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::Com::IBindCtx;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HWND_TOPMOST, SW_HIDE, SW_SHOWNORMAL,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, ShowWindowAsync, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
 static HWND_VAL: AtomicIsize = AtomicIsize::new(0);
+static TARGET_MONITOR: AtomicIsize = AtomicIsize::new(0);
 pub static VISIBLE: AtomicBool = AtomicBool::new(false);
 pub static JUST_SHOWN: AtomicBool = AtomicBool::new(false);
 pub static CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
+pub const BACKDROP_BRIGHTNESS: u8 = 76;
 
 pub fn set_hwnd(h: isize) {
     HWND_VAL.store(h, Ordering::Relaxed);
@@ -38,14 +43,13 @@ pub fn toggle() {
 
 /// Safe to call from any thread (the hook calls it).
 pub fn show() {
-    // Snapshot what's under the overlay first; drawn darkened as the backdrop.
-    *BACKDROP.lock().unwrap() = unsafe { cursor_monitor() }.and_then(|r| unsafe { capture(r) });
-    unsafe { fit_to_cursor_monitor(true) };
+    // Resolve the active app before Lumen takes focus. Leave capture and window
+    // creation to the UI thread so they cannot delay the keyboard hook.
+    let monitor = unsafe { active_monitor() };
+    TARGET_MONITOR.store(monitor.0 as isize, Ordering::Relaxed);
     VISIBLE.store(true, Ordering::Relaxed);
-    JUST_SHOWN.store(true, Ordering::Relaxed);
-    // Go through eframe so its own idea of visibility stays in sync.
+    JUST_SHOWN.store(true, Ordering::Release);
     if let Some(ctx) = CTX.get() {
-        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
         ctx.request_repaint();
     }
 }
@@ -61,32 +65,135 @@ pub fn hide() {
     }
 }
 
-/// Covers the whole monitor under the mouse. Called again on the UI thread in case a
-/// DPI change between monitors resized the window.
-unsafe fn cursor_monitor() -> Option<RECT> {
+unsafe fn active_monitor() -> HMONITOR {
     unsafe {
+        let foreground = GetForegroundWindow();
+        if !foreground.is_invalid() && foreground != GetDesktopWindow() && foreground != GetShellWindow() {
+            return MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        }
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcMonitor)
+        MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
     }
 }
 
-pub unsafe fn fit_to_cursor_monitor(asynchronous: bool) -> Option<RECT> {
+fn monitor_rect(monitor: HMONITOR) -> Option<RECT> {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool().then_some(info.rcMonitor)
+}
+
+/// Owned by the UI thread, which creates and destroys the native dimmers.
+#[derive(Default)]
+pub struct DisplayOverlay {
+    monitor: Option<RECT>,
+    dimmers: Vec<HWND>,
+}
+
+impl DisplayOverlay {
+    pub fn open(&mut self) -> Option<eframe::egui::ColorImage> {
+        self.close();
+        let selected = HMONITOR(TARGET_MONITOR.load(Ordering::Relaxed) as *mut c_void);
+        let monitor = monitor_rect(selected).or_else(|| monitor_rect(unsafe { active_monitor() }))?;
+        let backdrop = unsafe { capture(monitor) };
+        self.monitor = Some(monitor);
+        self.fit();
+
+        let mut others = Vec::<RECT>::new();
+        let _ = unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(&mut others as *mut Vec<RECT> as isize)) };
+        for rect in others.into_iter().filter(|rect| *rect != monitor) {
+            if let Some(window) = dim_monitor(rect) {
+                self.dimmers.push(window);
+            }
+        }
+        backdrop
+    }
+
+    pub fn fit(&self) {
+        let Some(r) = self.monitor else { return };
+        unsafe {
+            let mut current = RECT::default();
+            if GetWindowRect(hwnd(), &mut current).is_err() || current != r {
+                let _ = SetWindowPos(hwnd(), Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.monitor = None;
+        for window in self.dimmers.drain(..) {
+            let _ = unsafe { DestroyWindow(window) };
+        }
+    }
+}
+
+impl Drop for DisplayOverlay {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+unsafe extern "system" fn collect_monitor(_: HMONITOR, _: HDC, rect: *mut RECT, data: LPARAM) -> BOOL {
+    // EnumDisplayMonitors calls back synchronously with the live vector from open().
+    let monitors = unsafe { &mut *(data.0 as *mut Vec<RECT>) };
+    let rect = unsafe { *rect };
+    if !monitors.contains(&rect) {
+        monitors.push(rect);
+    }
+    true.into()
+}
+
+unsafe extern "system" fn dimmer_window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+fn dim_monitor(r: RECT) -> Option<HWND> {
+    static REGISTERED: OnceLock<bool> = OnceLock::new();
+    let class = w!("Lumen.MonitorDimmer");
     unsafe {
-        let r = cursor_monitor()?;
-        let flags = if asynchronous {
-            windows::Win32::UI::WindowsAndMessaging::SWP_ASYNCWINDOWPOS
-        } else {
-            SWP_SHOWWINDOW
-        };
-        let _ = SetWindowPos(hwnd(), Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
-        Some(r)
+        let instance = HINSTANCE(GetModuleHandleW(None).ok()?.0);
+        if !REGISTERED.get_or_init(|| {
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(dimmer_window_proc),
+                hInstance: instance,
+                lpszClassName: class,
+                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+                ..Default::default()
+            }) != 0
+        }) {
+            return None;
+        }
+
+        let window = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class,
+            PCWSTR::null(),
+            WS_POPUP,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+        .ok()?;
+        if SetLayeredWindowAttributes(window, COLORREF(0), 255 - BACKDROP_BRIGHTNESS, LWA_ALPHA).is_err()
+            || SetWindowPos(window, Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                .is_err()
+        {
+            let _ = DestroyWindow(window);
+            return None;
+        }
+        Some(window)
     }
 }
 
-pub static BACKDROP: Mutex<Option<eframe::egui::ColorImage>> = Mutex::new(None);
+pub fn show_native() {
+    unsafe {
+        let _ = ShowWindow(hwnd(), SW_SHOWNOACTIVATE);
+    }
+}
 
 unsafe fn capture(r: RECT) -> Option<eframe::egui::ColorImage> {
     unsafe {
@@ -110,11 +217,8 @@ unsafe fn capture(r: RECT) -> Option<eframe::egui::ColorImage> {
             },
             ..Default::default()
         };
-        let lines = if ok {
-            GetDIBits(mem, bmp, 0, h as u32, Some(bits.as_mut_ptr() as *mut c_void), &mut info, DIB_RGB_COLORS)
-        } else {
-            0
-        };
+        let lines =
+            if ok { GetDIBits(mem, bmp, 0, h as u32, Some(bits.as_mut_ptr() as *mut c_void), &mut info, DIB_RGB_COLORS) } else { 0 };
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
@@ -219,10 +323,7 @@ impl History {
     }
 
     pub fn load() -> Self {
-        let counts = Self::file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let counts = Self::file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Self { counts }
     }
 
@@ -245,11 +346,7 @@ const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 fn reg(args: &[&str]) -> bool {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg.exe")
-        .args(args)
-        .creation_flags(0x0800_0000)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    std::process::Command::new("reg.exe").args(args).creation_flags(0x0800_0000).output().is_ok_and(|o| o.status.success())
 }
 
 pub fn startup_enabled() -> bool {
