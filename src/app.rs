@@ -543,8 +543,11 @@ impl Lumen {
         // Keep keyboard selection visible on short displays.
         let first_row = self.selected.saturating_sub(rows.saturating_sub(1));
         let w = WIDTH.min(screen.width() - 40.0);
-        let h = BAR_H + FILTER_H + if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 48.0 };
-        let panel = Rect::from_center_size(screen.center(), vec2(w, h));
+        let list_h = |rows: usize| if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 48.0 };
+        let h = BAR_H + FILTER_H + list_h(rows);
+        // Pin the top where a full list would be centred, so the bar stays still as results change.
+        let full_h = BAR_H + FILTER_H + list_h(MAX_ROWS.min(available_rows));
+        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.center().y - full_h / 2.0), vec2(w, h));
 
         // Click on the dimmed area closes.
         if ui.interact(screen, Id::unique("dim"), Sense::click()).clicked()
