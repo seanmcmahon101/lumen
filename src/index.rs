@@ -193,7 +193,14 @@ impl Index {
     }
 
     pub fn rebuild(self: &Arc<Self>, on_done: impl Fn() + Send + Sync + 'static) {
-        let on_done = Arc::new(on_done);
+        self.rebuild_impl(Arc::new(on_done));
+    }
+
+    // Takes the callback as Arc<dyn Fn> so a requeued rebuild calls itself at
+    // runtime. Passing a fresh impl-Fn closure would nest one new generic type
+    // per requeue, and the compiler stops instantiating that chain at its
+    // recursion limit.
+    fn rebuild_impl(self: &Arc<Self>, on_done: Arc<dyn Fn() + Send + Sync + 'static>) {
         // Each mapped share has its own worker: a disconnected server cannot hold
         // up local indexing, another drive, or the search/render threads.
         let (network_index, network_done) = (self.clone(), on_done.clone());
@@ -258,7 +265,7 @@ impl Index {
             me.building.store(false, Ordering::SeqCst);
             on_done();
             if me.rebuild_again.swap(false, Ordering::SeqCst) {
-                me.rebuild(move || on_done());
+                me.rebuild_impl(on_done.clone());
             }
         });
     }
