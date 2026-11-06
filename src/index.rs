@@ -45,7 +45,7 @@ impl Entry {
     pub(crate) fn new(name: String, path: String, kind: Kind, depth: usize) -> Self {
         let (lower, location) = (name.to_lowercase(), path.to_lowercase());
         Self {
-            penalty: penalty(kind, &lower, &location),
+            penalty: penalty(kind, &lower),
             lower,
             location,
             name,
@@ -68,28 +68,21 @@ const CODE_EXTENSIONS: &[&str] = &[
     "rc", "map", "lock", "toml", "mod", "sum", "in", "am", "ac", "m4",
 ];
 
-/// Code files, and anything inside a package cache, vendored code or an unpacked
-/// source release, are seldom what a search is for: they rank below documents but
-/// still appear when nothing better matches.
-fn penalty(kind: Kind, lower_name: &str, location: &str) -> u16 {
-    let mut penalty = 0;
-    if kind == Kind::File && lower_name.rsplit_once('.').is_some_and(|(_, ext)| CODE_EXTENSIONS.contains(&ext)) {
-        penalty += 300;
-    }
-    if matches!(kind, Kind::File | Kind::Folder) && in_dependency_tree(location) {
-        penalty += 300;
-    }
-    penalty
+/// Code files are seldom what a search is for: they rank below documents but still
+/// appear when nothing better matches.
+fn penalty(kind: Kind, lower_name: &str) -> u16 {
+    if kind == Kind::File && lower_name.rsplit_once('.').is_some_and(|(_, ext)| CODE_EXTENSIONS.contains(&ext)) { 300 } else { 0 }
 }
 
-/// Below go\pkg\mod, vendor, third_party, testdata, externals or an SDK, or below
-/// a versioned folder such as libc@v1.55.3, Python-3.14.8 or 10.0.203.
-fn in_dependency_tree(location: &str) -> bool {
-    let Some((parent, _)) = location.rsplit_once('\\') else { return false };
-    format!("{parent}\\").contains("\\pkg\\mod\\")
-        || parent.split('\\').any(|folder| {
-            matches!(folder, "vendor" | "third_party" | "third-party" | "testdata" | "externals" | "sdk" | "sdks") || versioned(folder)
-        })
+/// A package cache, SDK, vendored code or unpacked versioned release: go\pkg\mod,
+/// vendor, third_party, testdata, externals, sdk, libc@v1.55.3, Python-3.14.8 or
+/// 10.0.203. Scans list the folder but do not go into it: its files are seldom
+/// wanted, and on a developer's PC they can be most of the index.
+fn package_folder(location: &str) -> bool {
+    let name = location.rsplit('\\').next().unwrap_or(location);
+    location.ends_with("\\pkg\\mod")
+        || matches!(name, "vendor" | "third_party" | "third-party" | "testdata" | "externals" | "sdk" | "sdks")
+        || versioned(name)
 }
 
 /// A dotted version, alone or after a name and @ or -: "10.0.203", "libc@v1.55.3",
@@ -285,7 +278,7 @@ impl Index {
                     let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     let Some(e) = scanned_entry(name, &path, &md, depth) else { continue };
-                    let walk_in = e.kind == Kind::Folder && descends(&e.lower, depth, &md);
+                    let walk_in = e.kind == Kind::Folder && descends(&e, &md);
                     found.push(Ok(e));
                     // A folder moved or renamed in brings its contents.
                     if walk_in {
@@ -525,7 +518,8 @@ fn scan_mapped(root: &str, mut publish: impl FnMut(&[Entry])) {
                 if kind.is_dir() { Kind::Folder } else { Kind::File },
                 depth + 1,
             ));
-            if kind.is_dir() && depth < 4 && !SKIP_DIRS.contains(&name.to_lowercase().as_str()) {
+            let skipped = entries.last().is_some_and(|e: &Entry| SKIP_DIRS.contains(&e.lower.as_str()) || package_folder(&e.location));
+            if kind.is_dir() && depth < 4 && !skipped {
                 queue.push_back((path, depth + 1));
             }
             if last_publish.elapsed() > Duration::from_secs(1) {
@@ -846,7 +840,7 @@ fn walk(mut queue: VecDeque<(PathBuf, usize)>, list: &mut Vec<Entry>, limit: usi
             let Ok(md) = de.metadata() else { continue };
             let path = de.path();
             let Some(e) = scanned_entry(name, &path, &md, depth + 1) else { continue };
-            let descend = e.kind == Kind::Folder && descends(&e.lower, depth + 1, &md);
+            let descend = e.kind == Kind::Folder && descends(&e, &md);
             list.push(e);
             count += 1;
             if count >= limit {
@@ -870,18 +864,23 @@ fn scanned_entry(name: String, path: &Path, md: &std::fs::Metadata, depth: usize
     Some(e)
 }
 
-/// The walk goes into this folder, found at `depth`.
-fn descends(lower_name: &str, depth: usize, md: &std::fs::Metadata) -> bool {
-    !md.file_type().is_symlink() && depth < MAX_DEPTH && !SKIP_DIRS.contains(&lower_name)
+/// The walk goes into this folder.
+fn descends(folder: &Entry, md: &std::fs::Metadata) -> bool {
+    !md.file_type().is_symlink()
+        && (folder.depth as usize) < MAX_DEPTH
+        && !SKIP_DIRS.contains(&folder.lower.as_str())
+        && !package_folder(&folder.location)
 }
 
 /// How deep the walk from `root` would find `path`, or None if it never goes there.
 fn watched_depth(root: &Path, path: &Path) -> Option<usize> {
-    let parts: Vec<String> =
-        path.strip_prefix(root).ok()?.components().map(|part| part.as_os_str().to_string_lossy().to_lowercase()).collect();
-    let (_, folders) = parts.split_last()?;
-    let skipped = folders.iter().any(|folder| folder.starts_with('.') || SKIP_DIRS.contains(&folder.as_str()));
-    (!skipped && parts.len() <= MAX_DEPTH).then_some(parts.len())
+    let depth = path.strip_prefix(root).ok()?.components().count();
+    let skipped = path.ancestors().skip(1).take(depth.saturating_sub(1)).any(|folder| {
+        let location = folder.to_string_lossy().to_lowercase();
+        let name = location.rsplit('\\').next().unwrap_or("");
+        name.starts_with('.') || SKIP_DIRS.contains(&name) || package_folder(&location)
+    });
+    (depth > 0 && !skipped && depth <= MAX_DEPTH).then_some(depth)
 }
 
 /// Copies text read by the previous scan into files whose size, date and attributes
@@ -999,12 +998,12 @@ mod tests {
     }
 
     #[test]
-    fn code_and_package_files_rank_below_documents_but_still_appear() {
+    fn code_files_rank_below_documents_but_still_appear() {
         let entry = |path: &str, kind| Entry::new(path.rsplit('\\').next().unwrap().into(), path.into(), kind, 3);
         let index = Index::default();
         *index.entries.write().unwrap() = Arc::new(vec![
-            entry(r"C:\Users\u\go\pkg\mod\modernc.org\libc@v1.55.3\src\env.c", Kind::File),
-            entry(r"C:\Users\u\Downloads\Python-3.14.8\PCbuild\env.bat", Kind::File),
+            entry(r"C:\Users\u\source\libc\src\env.c", Kind::File),
+            entry(r"C:\Users\u\Downloads\tools\env.bat", Kind::File),
             entry(r"W:\Accounts\BL2\Environmental Costs", Kind::Folder),
             entry(r"C:\Users\u\Documents\env notes.docx", Kind::File),
         ]);
@@ -1022,8 +1021,34 @@ mod tests {
         for folder in ["2024-01-15", "2024.01.15", "1.2", "fy2024-25", "q3 report-1.2", "accounts", "v1.2", "budget-"] {
             assert!(!versioned(folder), "{folder}");
         }
-        assert!(in_dependency_tree(r"c:\users\u\go\pkg\mod\cache\download\x.zip"));
-        assert!(!in_dependency_tree(r"c:\users\u\documents\pkg\mods.xlsx"));
+        assert!(package_folder(r"c:\users\u\go\pkg\mod"));
+        assert!(package_folder(r"c:\users\u\dotnet\sdk"));
+        assert!(!package_folder(r"c:\users\u\documents\pkg"));
+        assert!(!package_folder(r"c:\users\u\documents\mod"));
+    }
+
+    #[test]
+    fn scans_list_package_folders_without_going_in() {
+        let root = std::env::temp_dir().join(format!("lumen-packages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [r"Python-3.14.8\PCbuild", r"go\pkg\mod\libc@v1.55.3", "vendor", "Reports"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [r"Python-3.14.8\PCbuild\env.bat", r"go\pkg\mod\libc@v1.55.3\env.c", r"vendor\lib.c", r"Reports\env notes.txt"] {
+            std::fs::write(root.join(file), "x").unwrap();
+        }
+        let mut found = Vec::new();
+        walk(VecDeque::from([(root.clone(), 0)]), &mut found, 1000);
+        let mut names: Vec<&str> = found.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Python-3.14.8", "Reports", "env notes.txt", "go", "mod", "pkg", "vendor"]);
+
+        // The watcher agrees with the walk.
+        assert_eq!(watched_depth(&root, &root.join(r"Python-3.14.8\PCbuild\new.bat")), None);
+        assert_eq!(watched_depth(&root, &root.join(r"go\pkg\mod\x\y.go")), None);
+        assert_eq!(watched_depth(&root, &root.join(r"go\pkg\mod")), Some(3));
+        assert_eq!(watched_depth(&root, &root.join(r"Reports\q3.xlsx")), Some(2));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1140,9 +1165,10 @@ mod tests {
             content_bytes += e.content.len();
         }
         println!("{} entries, walk {walked:?}, content {} MB in {:?}", list.len(), content_bytes >> 20, start.elapsed() - walked);
-        let code = list.iter().filter(|e| e.penalty % 600 == 300 && !in_dependency_tree(&e.location)).count();
-        let packaged = list.iter().filter(|e| in_dependency_tree(&e.location)).count();
-        println!("ranked down: {code} code files elsewhere, {packaged} entries in package trees");
+        println!("{} code files ranked down", list.iter().filter(|e| e.penalty > 0).count());
+        for e in list.iter().filter(|e| e.kind == Kind::Folder && package_folder(&e.location)) {
+            println!("not scanned: {}", e.path);
+        }
         let index = Index::default();
         let without_content: Vec<Entry> = list.iter().map(|e| Entry { content: String::new(), ..e.clone() }).collect();
         let bare = Index::default();

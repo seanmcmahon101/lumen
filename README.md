@@ -44,10 +44,14 @@ close a running Lumen for you.
 Settings and commands named exactly appear above files; partial names such as
 `blue` only fill rows that files leave empty.
 
-Source code and scripts (`.c`, `.go`, `.py`, `.bat`, `.ps1`…), and anything inside
-package caches, SDKs, vendored code or unpacked versioned releases (`go\pkg\mod`,
-`dotnet\sdk\10.0.203`, `Python-3.14.8`), rank below documents. They still appear
-when nothing better matches, or when typed by exact name.
+Source code and scripts (`.c`, `.go`, `.py`, `.bat`, `.ps1`…) rank below documents.
+They still appear when nothing better matches, or when typed by exact name.
+
+Package caches, SDKs, vendored code and unpacked versioned releases (`go\pkg\mod`,
+`sdk`, `vendor`, `third_party`, `testdata`, `externals`, and folders such as
+`libc@v1.55.3`, `Python-3.14.8` or `10.0.203`) are listed by name but not scanned
+inside. On a developer's PC they were most of the index; skipping them made the
+index about a fifth of its size.
 
 Each keystroke searches the whole index at once, split across every CPU core; on
 a profile of about 115,000 files and 32 MB of workbook text, a search takes 2–6 ms.
