@@ -3,6 +3,8 @@
 A Windows launcher opened with **Win+Space**. Type to find applications, files,
 spreadsheets and Outlook mail. Enter opens, Ctrl+Enter reveals a local file,
 Tab completes, and Escape closes. Click the search filters to switch scope.
+Lumen remembers what you open for each search, so typing the same letters again
+puts that result first.
 
 ## Install on Windows
 

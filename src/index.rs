@@ -123,6 +123,15 @@ impl Index {
         });
     }
 
+    /// The indexed entry with this exact path.
+    pub fn get(&self, path: &str) -> Option<Entry> {
+        let entries = self.entries.read().unwrap().clone();
+        if let Some(e) = entries.iter().find(|e| e.path == path) {
+            return Some(e.clone());
+        }
+        self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.path == path).cloned())
+    }
+
     pub fn search(&self, query: &str, max: usize, uses: impl Fn(&str) -> u32) -> Vec<Entry> {
         let mut snapshots = vec![self.entries.read().unwrap().clone()];
         snapshots.extend(self.mapped.read().unwrap().values().cloned());
@@ -202,6 +211,25 @@ impl Index {
         best.sort_by(|a, b| b.0.cmp(&a.0));
         best.into_iter().map(|(_, i)| (*entries[i]).clone()).collect()
     }
+}
+
+/// Splits leading filter words ("excel ", "mail ", "type:app ", "ext:xlsm ") from
+/// the search term. A filter word only counts once a space follows it.
+pub fn split_filter(query: &str) -> (&str, &str) {
+    let mut rest = query.trim_start();
+    let mut first = true;
+    while let Some(end) = rest.find(char::is_whitespace) {
+        let word = rest[..end].to_lowercase();
+        let filter = word == "type:app"
+            || word.starts_with("ext:")
+            || (first && matches!(word.as_str(), "excel" | "sheets" | "type:excel" | "email" | "mail" | "type:email"));
+        if !filter {
+            break;
+        }
+        rest = rest[end..].trim_start();
+        first = false;
+    }
+    query.split_at(query.len() - rest.len())
 }
 
 fn mapped_roots() -> Vec<String> {
@@ -553,6 +581,16 @@ mod tests {
         assert_eq!(names("re")[0], "Remote Desktop");
         assert_eq!(names("vsc"), ["Visual Studio Code"]);
         assert_eq!(names("my rep"), ["my report.docx"]);
+    }
+
+    #[test]
+    fn splits_filter_words_from_term() {
+        assert_eq!(split_filter("excel bud"), ("excel ", "bud"));
+        assert_eq!(split_filter("Mail  invoice q3"), ("Mail  ", "invoice q3"));
+        assert_eq!(split_filter("excel ext:xlsm fore"), ("excel ext:xlsm ", "fore"));
+        assert_eq!(split_filter("excel"), ("", "excel"));
+        assert_eq!(split_filter("budget excel"), ("", "budget excel"));
+        assert_eq!(split_filter("report mail x"), ("", "report mail x"));
     }
 
     #[test]

@@ -311,20 +311,31 @@ pub fn load_icon(path: &str) -> Option<eframe::egui::ColorImage> {
     }
 }
 
-/// Launch counts, so things you open often rank higher.
+/// Launch counts, so things you open often rank higher, and the result last
+/// opened for each typed query, so that query brings it back first.
 #[derive(Clone)]
 pub struct History {
     counts: HashMap<String, u32>,
+    picks: HashMap<String, String>, // normalized typed query -> path
 }
 
 impl History {
-    fn file() -> Option<std::path::PathBuf> {
-        std::env::var("APPDATA").ok().map(|p| std::path::Path::new(&p).join("Lumen").join("history.json"))
+    fn file(name: &str) -> Option<std::path::PathBuf> {
+        std::env::var("APPDATA").ok().map(|p| std::path::Path::new(&p).join("Lumen").join(name))
+    }
+
+    fn write(name: &str, json: serde_json::Result<Vec<u8>>) {
+        if let (Some(f), Ok(json)) = (Self::file(name), json) {
+            let _ = std::fs::create_dir_all(f.parent().unwrap());
+            let _ = std::fs::write(f, json);
+        }
     }
 
     pub fn load() -> Self {
-        let counts = Self::file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { counts }
+        let read = |name: &str| Self::file(name).and_then(|f| std::fs::read(f).ok());
+        let counts = read("history.json").and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let picks = read("picks.json").and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        Self { counts, picks }
     }
 
     pub fn uses(&self, key: &str) -> u32 {
@@ -333,12 +344,54 @@ impl History {
 
     pub fn bump(&mut self, key: &str) {
         *self.counts.entry(key.to_string()).or_default() += 1;
-        if let Some(f) = Self::file() {
-            let _ = std::fs::create_dir_all(f.parent().unwrap());
-            if let Ok(json) = serde_json::to_vec(&self.counts) {
-                let _ = std::fs::write(f, json);
-            }
+        Self::write("history.json", serde_json::to_vec(&self.counts));
+    }
+
+    /// The path last opened after typing `query`.
+    pub fn pick(&self, query: &str) -> Option<&str> {
+        self.picks.get(&normalize(query)).map(String::as_str)
+    }
+
+    /// Remember `path` for `query` and for each shorter prefix of it.
+    pub fn learn(&mut self, query: &str, path: &str) {
+        for key in pick_keys(query) {
+            self.picks.insert(key, path.to_string());
         }
+        Self::write("picks.json", serde_json::to_vec(&self.picks));
+    }
+}
+
+fn normalize(query: &str) -> String {
+    query.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Every prefix of the search term from two characters up, keeping any filter
+/// words in front: "excel bud" gives "excel bu" and "excel bud".
+fn pick_keys(query: &str) -> Vec<String> {
+    let (filter, term) = crate::index::split_filter(query);
+    let ends: Vec<usize> = term.char_indices().map(|(i, c)| i + c.len_utf8()).skip(1).take(39).collect();
+    let mut keys: Vec<String> = ends.into_iter().map(|end| normalize(&format!("{filter}{}", &term[..end]))).collect();
+    keys.dedup();
+    keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_learn_prefixes_behind_filters() {
+        assert_eq!(pick_keys("jd"), ["jd"]);
+        assert_eq!(pick_keys("Excel  Bud"), ["excel bu", "excel bud"]);
+        assert_eq!(pick_keys("j"), Vec::<String>::new());
+        assert_eq!(pick_keys("mail "), Vec::<String>::new());
+        let mut history = History { counts: HashMap::new(), picks: HashMap::new() };
+        for key in pick_keys("john d") {
+            history.picks.insert(key, "C:\\jd.xlsx".into());
+        }
+        assert_eq!(history.pick("JO"), Some("C:\\jd.xlsx"));
+        assert_eq!(history.pick("john  d"), Some("C:\\jd.xlsx"));
+        assert_eq!(history.pick("excel jo"), None);
     }
 }
 

@@ -166,6 +166,16 @@ impl Lumen {
                         Err(_) => note = "Outlook index unavailable · try Outlook online".into(),
                     }
                 }
+                // What you last opened after typing this goes first, even if it doesn't match.
+                if let Some(path) = history.pick(&q) {
+                    let learned = match found.iter().position(|e| e.path == path) {
+                        Some(i) => Some(found.remove(i)),
+                        None => search_index.get(path),
+                    };
+                    if let Some(e) = learned {
+                        found.insert(0, e);
+                    }
+                }
                 if answers.send((q, generation, found, note)).is_err() {
                     break;
                 }
@@ -397,17 +407,23 @@ impl Lumen {
     }
 
     fn completion(&self) -> Option<String> {
-        let c = self.results.get(self.selected)?.complete.as_ref()?;
-        let q = &self.query;
-        if q.is_empty() || c.len() <= q.len() || !c.is_char_boundary(q.len()) || !c[..q.len()].eq_ignore_ascii_case(q) {
+        let item = self.results.get(self.selected)?;
+        let c = item.complete.as_ref()?;
+        let (_, q) = crate::index::split_filter(&self.query);
+        if q.is_empty() {
             return None;
         }
-        Some(c[q.len()..].to_string())
+        if c.is_char_boundary(q.len()) && c[..q.len()].eq_ignore_ascii_case(q) {
+            return (c.len() > q.len()).then(|| c[q.len()..].to_string());
+        }
+        // A learned pick whose name doesn't start with what was typed ("jd").
+        (item.history_key.is_some() && item.history_key.as_deref() == self.history.pick(&self.query)).then(|| format!(" — {c}"))
     }
 
     fn accept_completion(&mut self, ctx: &egui::Context) {
         if let Some(c) = self.results.get(self.selected).and_then(|i| i.complete.clone()) {
-            self.query = c;
+            let (filter, _) = crate::index::split_filter(&self.query);
+            self.query = format!("{filter}{c}");
             self.set_cursor(ctx, false);
         }
     }
@@ -438,6 +454,7 @@ impl Lumen {
         }
         if let Some(k) = item.history_key.clone() {
             self.history.bump(&k);
+            self.history.learn(&self.query, &k);
         }
         self.search_key = None;
         self.last_query = None; // re-rank next time
@@ -537,10 +554,11 @@ impl Lumen {
             return;
         }
 
-        // Glow: a wide soft halo plus a tighter bright rim.
+        // Glow: stacked white layers, from a wide aura that lifts the backdrop to a hot rim at the edge.
         let r = CornerRadius::same(RADIUS);
-        painter.add(Shadow { offset: [0, 0], blur: 90, spread: 8, color: Color32::from_white_alpha(86) }.as_shape(panel, r));
-        painter.add(Shadow { offset: [0, 0], blur: 26, spread: 2, color: Color32::from_white_alpha(164) }.as_shape(panel, r));
+        for (blur, spread, alpha) in [(255, 64, 72), (160, 28, 140), (64, 10, 220), (18, 3, 255)] {
+            painter.add(Shadow { offset: [0, 0], blur, spread, color: Color32::from_white_alpha(alpha) }.as_shape(panel, r));
+        }
         painter.rect_filled(panel, r, Color32::WHITE);
 
         // Search bar
@@ -835,10 +853,17 @@ fn setup_style(ctx: &egui::Context) {
     };
     let segoe = add("segoe", "segoeui.ttf");
     let icons = add("icons", "SegoeIcons.ttf") || add("icons", "segmdl2.ttf");
+    // Fallbacks for Chinese, Japanese and Korean names; Segoe UI has no CJK glyphs.
+    let fallbacks: Vec<&str> = [("yahei", "msyh.ttc"), ("malgun", "malgun.ttf")]
+        .into_iter()
+        .filter(|(name, file)| add(name, file))
+        .map(|(name, _)| name)
+        .collect();
     let proportional = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
     if segoe {
         proportional.insert(0, "segoe".into());
     }
+    proportional.extend(fallbacks.iter().map(|name| name.to_string()));
     let mut icon_family = proportional.clone();
     if icons {
         icon_family.insert(0, "icons".into());
