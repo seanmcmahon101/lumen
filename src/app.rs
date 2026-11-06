@@ -310,6 +310,7 @@ impl Lumen {
             .flatten();
         if !same_query {
             self.selection_by_user = false;
+            self.armed = None; // editing the text, even back to the same words, asks again
         }
         self.last_query = Some(self.query.clone());
         self.last_generation = self.index.generation();
@@ -833,10 +834,12 @@ impl eframe::App for Lumen {
         }
 
         while let Ok((q, generation, found, note)) = self.search_rx.try_recv() {
-            if q == self.query && generation <= self.index.generation() {
+            if q == self.query {
+                // Show any answer for this text, but only the newest search ends the wait,
+                // so an Enter pressed meanwhile opens what the refreshed index found.
+                self.searching &= self.search_key != Some((q, generation));
                 self.found = found;
                 self.search_note = note;
-                self.searching = false;
                 self.last_query = None;
             }
         }

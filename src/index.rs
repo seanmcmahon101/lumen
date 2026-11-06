@@ -177,6 +177,7 @@ pub struct Index {
     entries: RwLock<Arc<Vec<Entry>>>,
     generation: AtomicU64,
     building: AtomicBool,
+    rebuild_again: AtomicBool, // a rebuild was asked for while one was running
     mapped: RwLock<HashMap<String, Arc<Vec<Entry>>>>,
     scanning_drives: Mutex<HashSet<String>>,
     changes: RwLock<Arc<Changes>>,
@@ -213,9 +214,13 @@ impl Index {
                 });
             }
         });
-        if self.building.swap(true, Ordering::AcqRel) {
+        // A rebuild asked for mid-scan runs straight after it: the scan may already have
+        // passed the folders whose changes overflowed a watch. Flag first, then claim.
+        self.rebuild_again.store(true, Ordering::SeqCst);
+        if self.building.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.rebuild_again.store(false, Ordering::SeqCst);
         let me = self.clone();
         std::thread::spawn(move || {
             let publish = |list: Vec<Entry>| {
@@ -250,8 +255,11 @@ impl Index {
                 }
             }
             publish(list);
-            me.building.store(false, Ordering::Release);
+            me.building.store(false, Ordering::SeqCst);
             on_done();
+            if me.rebuild_again.swap(false, Ordering::SeqCst) {
+                me.rebuild(move || on_done());
+            }
         });
     }
 
