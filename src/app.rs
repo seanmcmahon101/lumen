@@ -47,6 +47,17 @@ enum Action {
     Copy(String),
     Quit,
     ToggleStartup,
+    System(&'static crate::system::Command),
+}
+
+impl Action {
+    /// What a second Enter will do, for commands that ask first.
+    fn confirm(&self) -> Option<&'static str> {
+        match self {
+            Action::System(command) => command.confirm,
+            _ => None,
+        }
+    }
 }
 
 struct Item {
@@ -102,6 +113,7 @@ pub struct Lumen {
     search_note: String,
     latest_query: Arc<Mutex<String>>,
     pending: Option<(String, Mode)>, // Enter pressed before this query's results arrived
+    armed: Option<(String, String)>, // (query, title): a command waiting for a second Enter
 }
 
 impl Lumen {
@@ -255,6 +267,7 @@ impl Lumen {
             search_note: String::new(),
             latest_query,
             pending: None,
+            armed: None,
         }
     }
 
@@ -278,8 +291,14 @@ impl Lumen {
         state.store(ctx, Self::query_id());
     }
 
+    /// The first Enter on this command was pressed, with the query unchanged since.
+    fn is_armed(&self, title: &str) -> bool {
+        self.armed.as_ref().is_some_and(|(query, armed)| *query == self.query && armed == title)
+    }
+
     fn hide(&mut self) {
         self.pending = None;
+        self.armed = None;
         self.display_overlay.close();
         win::hide();
     }
@@ -354,11 +373,21 @@ impl Lumen {
             }
         }
 
-        let room = MAX_ROWS.saturating_sub(self.results.len() + commands.len() + 1);
-        for e in self.found.iter().take(room).cloned() {
-            let item = self.entry_item(e);
-            self.results.push(item);
+        // Windows Settings and system commands, never behind a filter like "excel ".
+        // Exact names go above files; partial names only fill rows files leave empty.
+        let (exact, partial) =
+            if crate::index::split_filter(&self.query).0.is_empty() { crate::system::find(&t) } else { Default::default() };
+        let room = MAX_ROWS.saturating_sub(self.results.len() + exact.len() + commands.len() + 1);
+        let mut files: Vec<Item> = self.found.iter().take(room).cloned().map(|e| self.entry_item(e)).collect();
+        // What was last opened for this query stays first.
+        let learned = self.history.pick(&self.query).is_some_and(|path| self.found.first().is_some_and(|e| e.path == path));
+        if learned && !files.is_empty() {
+            self.results.push(files.remove(0));
         }
+        self.results.extend(exact.into_iter().map(system_item));
+        self.results.extend(files);
+        let room = MAX_ROWS.saturating_sub(self.results.len() + commands.len() + 1);
+        self.results.extend(partial.into_iter().take(room).map(system_item));
         self.results.extend(commands);
 
         if let Some(term) = crate::mail::query(&t) {
@@ -456,6 +485,12 @@ impl Lumen {
         if i >= self.results.len() {
             return;
         }
+        // Restart, Shut down and Sign out close apps: the first Enter only asks.
+        let title = &self.results[i].title;
+        if self.results[i].action.confirm().is_some() && !self.is_armed(title) {
+            self.armed = Some((self.query.clone(), title.clone()));
+            return;
+        }
         self.hide();
         let item = &self.results[i];
         match (mode, &item.reveal, &item.action) {
@@ -472,6 +507,7 @@ impl Lumen {
             (_, _, Action::Copy(text)) => win::copy(text),
             (_, _, Action::Quit) => crate::tray::quit(),
             (_, _, Action::ToggleStartup) => win::set_startup(!win::startup_enabled()),
+            (_, _, Action::System(command)) => crate::system::run(&command.target),
         }
         if let Some(k) = item.history_key.clone() {
             self.history.bump(&k);
@@ -512,10 +548,12 @@ impl Lumen {
             if i.consume_key(Modifiers::NONE, Key::ArrowDown) && n > 0 {
                 self.selection_by_user = true;
                 self.selected = (self.selected + 1).min(n - 1);
+                self.armed = None;
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
                 self.selection_by_user = true;
                 self.selected = self.selected.saturating_sub(1);
+                self.armed = None;
             }
             if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Enter) {
                 run = Some(Some(Mode::Admin));
@@ -708,7 +746,12 @@ impl Lumen {
             let text_x = panel.left() + TEXT_INSET;
             let max_w = label.left() - text_x - 16.0;
             let title = painter.layout_job(single_line(&item.title, 19.0, TEXT, max_w));
-            let sub = painter.layout_job(single_line(&item.subtitle, 15.0, SUBTLE, max_w));
+            let sub = match item.action.confirm() {
+                Some(what) if self.is_armed(&item.title) => {
+                    painter.layout_job(single_line(&format!("Press Enter again to {what}"), 15.0, TEXT, max_w))
+                }
+                _ => painter.layout_job(single_line(&item.subtitle, 15.0, SUBTLE, max_w)),
+            };
             let top = row.center().y - (title.size().y + 3.0 + sub.size().y) / 2.0;
             painter.galley(pos2(text_x, top), title.clone(), TEXT);
             painter.galley(pos2(text_x, top + title.size().y + 3.0), sub, SUBTLE);
@@ -723,7 +766,8 @@ impl Lumen {
         } else {
             let selected = self.results.get(self.selected);
             let copy_action = selected.is_some_and(|item| matches!(item.action, Action::Copy(_)));
-            let mut hints = vec![("Enter", if copy_action { "Copy answer" } else { "Open" })];
+            let asks = selected.is_some_and(|item| item.action.confirm().is_some());
+            let mut hints = vec![("Enter", if copy_action { "Copy answer" } else if asks { "Confirm" } else { "Open" })];
             if selected.is_some_and(|item| item.reveal.is_some()) {
                 hints.push(("Ctrl+Enter", "Show in folder"));
             }
@@ -838,6 +882,13 @@ impl eframe::App for Lumen {
             ui.ctx().request_repaint();
         }
     }
+}
+
+fn system_item(command: &'static crate::system::Command) -> Item {
+    let label = if command.note == "Windows Settings" { "Settings" } else { "Windows" };
+    let mut item = simple(command.title, command.note, label, command.glyph, Action::System(command));
+    item.complete = Some(command.title.into());
+    item
 }
 
 fn simple(title: &str, subtitle: &str, label: &str, glyph: char, action: Action) -> Item {

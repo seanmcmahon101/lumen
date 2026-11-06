@@ -5,6 +5,7 @@ mod calc;
 mod hook;
 mod index;
 mod mail;
+mod system;
 mod tray;
 mod update;
 mod watch;

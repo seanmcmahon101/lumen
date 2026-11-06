@@ -37,6 +37,12 @@ close a running Lumen for you.
 - `ext:xlsm forecast` — a specific file extension.
 - `mail invoice` — Outlook messages matching all words.
 - `type:app code` — applications only.
+- `bluetooth`, `dark mode`, `env vars` — open a Windows Settings page or tool.
+- `lock`, `restart`, `shut down`, `sign out`, `empty recycle bin` — system commands.
+  Restart, Shut down and Sign out ask for a second Enter first.
+
+Settings and commands named exactly appear above files; partial names such as
+`blue` only fill rows that files leave empty.
 
 Each keystroke searches the whole index at once, split across every CPU core; on
 a profile of about 115,000 files and 32 MB of workbook text, a search takes 2–6 ms.
