@@ -121,3 +121,7 @@ To time searches over your own profile:
 ```powershell
 cargo test --release -- --ignored --nocapture search_speed
 ```
+
+## License
+
+Lumen is released under the [MIT license](LICENSE).

@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: read # lets SignPath read the uploaded artifact while signing
 
 jobs:
   release:
@@ -19,6 +20,9 @@ jobs:
     env:
       RUSTFLAGS: '-C target-feature=+crt-static'
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      # Signing activates automatically once SIGNPATH_API_TOKEN and
+      # SIGNPATH_ORGANIZATION_ID are added as repository secrets.
+      HAS_SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -72,7 +76,43 @@ jobs:
             throw 'Per-user uninstall failed'
           }
 
+      # SignPath Foundation signs the installer on their HSM free of charge for
+      # OSS. Portal setup must match these slugs: project "lumen", signing
+      # policy "release-signing", and an artifact configuration whose root is
+      # <zip-file> (upload-artifact zips the file) containing one .exe entry.
+      - name: Upload installer for signing
+        id: upload-unsigned-artifact
+        if: env.HAS_SIGNPATH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lumen-installer-unsigned
+          path: ${{ env.SETUP }}
+
+      - name: Submit signing request to SignPath
+        if: env.HAS_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'lumen'
+          signing-policy-slug: 'release-signing'
+          github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
+          output-artifact-directory: ${{ github.workspace }}/target/installer/signed
+
       - name: Publish installer
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:RELEASE_TAG $env:SETUP target/installer/Lumen-Setup-x64.exe --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes
+        run: |
+          $versioned = Resolve-Path $env:SETUP
+          # SignPath (upstream step) extracts the signed installer here.
+          $signed = Join-Path 'target/installer/signed' (Split-Path $versioned -Leaf)
+          $setup = if (Test-Path $signed) {
+            Write-Host 'Publishing the SignPath-signed installer.'
+            (Resolve-Path $signed).Path
+          } else {
+            Write-Host 'No SignPath secrets configured; publishing unsigned installer.'
+            $versioned.Path
+          }
+          # The fixed-name asset serves updates offered by Lumen 0.4.2 and earlier.
+          Copy-Item $setup 'target/installer/Lumen-Setup-x64.exe' -Force
+          gh release create $env:RELEASE_TAG $setup 'target/installer/Lumen-Setup-x64.exe' --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes
