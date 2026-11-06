@@ -38,9 +38,13 @@ close a running Lumen for you.
 - `mail invoice` — Outlook messages matching all words.
 - `type:app code` — applications only.
 
-Search runs on a debounced background worker. Obsolete mail searches are cancelled;
-old responses cannot replace newer queries. Applications appear before the file
-scan completes. Files become searchable before workbook content finishes indexing.
+Each keystroke searches the whole index at once, split across every CPU core; on
+a profile of about 115,000 files and 32 MB of workbook text, a search takes 2–6 ms.
+The previous results stay on screen until the new ones arrive, and Enter pressed
+before they arrive opens the top new result. Mail searches wait for typing to pause.
+Obsolete mail searches are cancelled; old responses cannot replace newer queries.
+Applications appear before the file scan completes. Files become searchable before
+workbook content finishes indexing.
 
 ## Excel coverage
 
@@ -54,8 +58,9 @@ by name and path only. Exact folder matches outrank incidental file prefixes. In
 match by filename; content indexing does not download them.
 
 XLSX, XLS, XLSM, XLSB and ODS contents are read with Calamine; CSV/TSV text is also
-indexed. Limits: 16 MB source file, first 32 worksheets, roughly 128 KB indexed text
-per file, 512 characters per cell and 32 MB total indexed content. Password-protected,
+indexed. Each distinct word is kept once per file, so repeated labels and values
+do not use up the limits. Limits: 16 MB source file, first 32 worksheets, 128 KB of
+distinct words per file, 512 characters per cell and 32 MB total indexed content. Password-protected,
 unreadable or oversized files remain searchable by name and folder. Formulas are
 not evaluated. Search opens the workbook, not a specific cell. Saved EML text is
 searchable; encoded MIME bodies/attachments are not decoded. MSG is filename-only.
@@ -89,3 +94,9 @@ cargo build --release
 
 Tests cover ranking, filters, spelling tolerance, folder/content matching,
 workbook extraction, mail scope parsing and calculator behavior.
+
+To time searches over your own profile:
+
+```powershell
+cargo test --release -- --ignored --nocapture search_speed
+```

@@ -101,6 +101,7 @@ pub struct Lumen {
     searching: bool,
     search_note: String,
     latest_query: Arc<Mutex<String>>,
+    pending: Option<(String, Mode)>, // Enter pressed before this query's results arrived
 }
 
 impl Lumen {
@@ -145,10 +146,18 @@ impl Lumen {
         let worker_query = latest_query.clone();
         let (search_index, search_ctx) = (index.clone(), ctx.clone());
         std::thread::spawn(move || {
+            // Start the search pool now, not on the first keystroke.
+            rayon::broadcast(|_| ());
             while let Ok(mut request) = requests.recv() {
-                std::thread::sleep(Duration::from_millis(70));
                 while let Ok(newer) = requests.try_recv() {
                     request = newer;
+                }
+                // Search the index at once. Mail starts PowerShell, so wait for typing to pause.
+                if crate::mail::query(&request.0).is_some() {
+                    std::thread::sleep(Duration::from_millis(70));
+                    while let Ok(newer) = requests.try_recv() {
+                        request = newer;
+                    }
                 }
                 let (q, generation, history) = request;
                 let mut found = search_index.search(&q, MAX_ROWS - 1, |p| history.uses(p));
@@ -243,6 +252,7 @@ impl Lumen {
             searching: false,
             search_note: String::new(),
             latest_query,
+            pending: None,
         }
     }
 
@@ -267,6 +277,7 @@ impl Lumen {
     }
 
     fn hide(&mut self) {
+        self.pending = None;
         self.display_overlay.close();
         win::hide();
     }
@@ -288,8 +299,12 @@ impl Lumen {
         if self.search_key.as_ref() != Some(&key) {
             *self.latest_query.lock().unwrap() = self.query.clone();
             if self.search_key.as_ref().is_none_or(|previous| previous.0 != key.0) {
-                self.found.clear();
                 self.search_note.clear();
+                // Keep the last results on screen until this query's arrive, milliseconds
+                // later, so the list does not collapse on every keystroke. Mail takes seconds.
+                if t.is_empty() || crate::mail::query(&t).is_some() {
+                    self.found.clear();
+                }
             }
             self.search_key = Some(key.clone());
             self.searching = !t.is_empty();
@@ -522,6 +537,11 @@ impl Lumen {
         }
         match run {
             Some(None) => self.hide(),
+            // Typed fast and pressed Enter before this query's results arrived:
+            // open the top result once they do, not what the last query found.
+            Some(Some(mode)) if self.searching && !self.selection_by_user && crate::mail::query(&self.query).is_none() => {
+                self.pending = Some((self.query.clone(), mode));
+            }
             Some(Some(mode)) if n > 0 => self.execute(self.selected, mode),
             _ => {}
         }
@@ -797,6 +817,13 @@ impl eframe::App for Lumen {
         self.handle_keys(ctx);
         if self.last_query.as_deref() != Some(self.query.as_str()) {
             self.refresh(); // Tab completion changed the text
+        }
+        if !self.searching
+            && let Some((query, mode)) = self.pending.take()
+            && query == self.query
+            && !self.results.is_empty()
+        {
+            self.execute(self.selected, mode);
         }
     }
 

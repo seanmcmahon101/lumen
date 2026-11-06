@@ -1,6 +1,7 @@
 //! In-memory index of installed apps and everything under the user profile.
 
 use calamine::{Reader, open_workbook_auto};
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::os::windows::fs::MetadataExt;
@@ -132,10 +133,9 @@ impl Index {
         self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.path == path).cloned())
     }
 
-    pub fn search(&self, query: &str, max: usize, uses: impl Fn(&str) -> u32) -> Vec<Entry> {
+    pub fn search(&self, query: &str, max: usize, uses: impl Fn(&str) -> u32 + Sync) -> Vec<Entry> {
         let mut snapshots = vec![self.entries.read().unwrap().clone()];
         snapshots.extend(self.mapped.read().unwrap().values().cloned());
-        let entries: Vec<&Entry> = snapshots.iter().flat_map(|entries| entries.iter()).collect();
         let q = query.trim().to_lowercase();
         if q.is_empty() || max == 0 {
             return Vec::new();
@@ -167,50 +167,77 @@ impl Index {
             .map(|(_, token)| token)
             .collect();
         let needle = tokens.join(" ");
+        let query = Query { scope, ext, needle: &needle, tokens: &tokens };
 
-        // min-heap of the best `max` (score, index)
-        let mut heap: BinaryHeap<Reverse<(i32, usize)>> = BinaryHeap::with_capacity(max + 1);
-        for (i, e) in entries.iter().enumerate() {
-            if (scope == "excel" && (e.kind != Kind::File || !spreadsheet(&e.lower)))
-                || (scope == "email" && !matches!(extension(&e.lower), "eml" | "msg"))
-                || (scope == "app" && e.kind != Kind::App)
-                || (!ext.is_empty() && extension(&e.lower) != ext)
-            {
-                continue;
-            }
-            let mut s = if tokens.is_empty() { 100 } else { score(e, &needle, &tokens) };
-            if s <= 0 {
-                continue;
-            }
-            // Exact folder intent must beat incidental prefixes, even when a
-            // similarly named file has a large launch-history boost.
-            if e.kind == Kind::Folder && (e.lower == needle || e.location == needle) {
-                s += 1000;
-            }
-            if e.kind == Kind::File && matches!(extension(&e.lower), "ps1xml" | "psd1" | "psm1" | "dll" | "pdb") {
-                s -= 300;
-            }
-            s += match e.kind {
-                Kind::App => 200,
-                Kind::Folder => 40,
-                Kind::File => 0,
-                Kind::Email => 0,
-            } - e.depth as i32 * 4;
-            let u = uses(&e.path);
-            if u > 0 {
-                s += (u.min(7) as i32 * 60).min(400);
-            }
-            if heap.len() < max {
-                heap.push(Reverse((s, i)));
-            } else if heap.peek().is_some_and(|Reverse((min, _))| s > *min) {
-                heap.pop();
-                heap.push(Reverse((s, i)));
-            }
-        }
-        let mut best: Vec<(i32, usize)> = heap.into_iter().map(|Reverse(x)| x).collect();
-        best.sort_by(|a, b| b.0.cmp(&a.0));
-        best.into_iter().map(|(_, i)| (*entries[i]).clone()).collect()
+        // Score small slices of the index on rayon's pool, which stays running between
+        // searches (starting threads costs milliseconds on Windows) and lets idle cores
+        // take slices from busy ones, since workbook text is unevenly spread.
+        let chunks: Vec<&[Entry]> = snapshots.iter().flat_map(|entries| entries.chunks(CHUNK)).collect();
+        let mut best: Vec<(i32, (usize, usize), &Entry)> = chunks
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(k, chunk)| {
+                // (slice, position) keeps index order on equal scores.
+                best_in(chunk, &query, max, &uses).into_iter().map(move |(s, i, e)| (s, (k, i), e))
+            })
+            .collect();
+        best.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        best.into_iter().take(max).map(|(_, _, e)| e.clone()).collect()
     }
+}
+
+/// Entries per search slice.
+const CHUNK: usize = 2048;
+
+struct Query<'a> {
+    scope: &'a str,
+    ext: &'a str,
+    needle: &'a str,
+    tokens: &'a [&'a str],
+}
+
+/// The best `max` entries of `entries` with their scores and positions.
+fn best_in<'e>(entries: &'e [Entry], q: &Query, max: usize, uses: &impl Fn(&str) -> u32) -> Vec<(i32, usize, &'e Entry)> {
+    // A min-heap: the weakest kept result is on top, and on equal scores the later entry.
+    let mut heap: BinaryHeap<Reverse<(i32, Reverse<usize>)>> = BinaryHeap::with_capacity(max + 1);
+    for (i, e) in entries.iter().enumerate() {
+        if (q.scope == "excel" && (e.kind != Kind::File || !spreadsheet(&e.lower)))
+            || (q.scope == "email" && !matches!(extension(&e.lower), "eml" | "msg"))
+            || (q.scope == "app" && e.kind != Kind::App)
+            || (!q.ext.is_empty() && extension(&e.lower) != q.ext)
+        {
+            continue;
+        }
+        let mut s = if q.tokens.is_empty() { 100 } else { score(e, q.needle, q.tokens) };
+        if s <= 0 {
+            continue;
+        }
+        // Exact folder intent must beat incidental prefixes, even when a
+        // similarly named file has a large launch-history boost.
+        if e.kind == Kind::Folder && (e.lower == q.needle || e.location == q.needle) {
+            s += 1000;
+        }
+        if e.kind == Kind::File && matches!(extension(&e.lower), "ps1xml" | "psd1" | "psm1" | "dll" | "pdb") {
+            s -= 300;
+        }
+        s += match e.kind {
+            Kind::App => 200,
+            Kind::Folder => 40,
+            Kind::File => 0,
+            Kind::Email => 0,
+        } - e.depth as i32 * 4;
+        let u = uses(&e.path);
+        if u > 0 {
+            s += (u.min(7) as i32 * 60).min(400);
+        }
+        if heap.len() < max {
+            heap.push(Reverse((s, Reverse(i))));
+        } else if heap.peek().is_some_and(|Reverse((min, _))| s > *min) {
+            heap.pop();
+            heap.push(Reverse((s, Reverse(i))));
+        }
+    }
+    heap.into_iter().map(|Reverse((s, Reverse(i)))| (s, i, &entries[i])).collect()
 }
 
 /// Splits leading filter words ("excel ", "mail ", "type:app ", "ext:xlsm ") from
@@ -344,7 +371,7 @@ fn contextual_score(e: &Entry, tokens: &[&str]) -> i32 {
             rank = rank.min(180);
             continue;
         }
-        if token.len() >= 4 && e.lower.split(|c: char| !c.is_alphanumeric()).any(|w| one_edit(w, token)) {
+        if token.len() >= 4 && near_word(&e.lower, token) {
             rank = rank.min(120);
             continue;
         }
@@ -353,10 +380,27 @@ fn contextual_score(e: &Entry, tokens: &[&str]) -> i32 {
     rank
 }
 
+/// A word of `name` is within one edit of `token`.
+fn near_word(name: &str, token: &str) -> bool {
+    // Most names are ASCII: split bytes rather than decode characters.
+    if name.is_ascii() && token.is_ascii() {
+        let token = token.as_bytes();
+        return name.as_bytes().split(|b| !b.is_ascii_alphanumeric()).any(|word| one_edit_in(word, token));
+    }
+    name.split(|c: char| !c.is_alphanumeric()).any(|word| one_edit(word, token))
+}
+
 fn one_edit(a: &str, b: &str) -> bool {
-    if a.is_ascii() && b.is_ascii() && a.len().abs_diff(b.len()) > 1 { return false; }
+    // Bytes are characters in ASCII, which spares an allocation per word on every search.
+    if a.is_ascii() && b.is_ascii() {
+        return one_edit_in(a.as_bytes(), b.as_bytes());
+    }
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    one_edit_in(&a, &b)
+}
+
+fn one_edit_in<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     if a.len().abs_diff(b.len()) > 1 {
         return false;
     }
@@ -401,13 +445,14 @@ fn enrich(e: &mut Entry) {
     if md.len() > 16 * 1024 * 1024 || md.file_attributes() & (0x1000 | 0x40000 | 0x400000) != 0 {
         return;
     }
-    const LIMIT: usize = 128 * 1024;
     if matches!(ext, "csv" | "tsv" | "eml") {
         use std::io::Read;
         if let Ok(f) = std::fs::File::open(&e.path) {
             let mut bytes = Vec::new();
-            if f.take(LIMIT as u64).read_to_end(&mut bytes).is_ok() {
-                e.content = String::from_utf8_lossy(&bytes).to_lowercase();
+            if f.take(CONTENT_LIMIT as u64).read_to_end(&mut bytes).is_ok() {
+                let mut words = Words::default();
+                words.add(&String::from_utf8_lossy(&bytes).to_lowercase());
+                e.content = words.text;
                 e.detail = if ext == "eml" { "Saved email · text searchable" } else { "Cell text searchable" }.into();
             }
         }
@@ -416,19 +461,52 @@ fn enrich(e: &mut Entry) {
     if let Ok(mut book) = open_workbook_auto(&e.path) {
         let names = book.sheet_names();
         e.detail = format!("Sheets: {}", names.join(", "));
-        e.content = names.join(" ").to_lowercase();
+        let mut words = Words::default();
+        words.add(&names.join(" ").to_lowercase());
         for name in names.iter().take(32) {
-            if e.content.len() >= LIMIT {
+            if words.full() {
                 break;
             }
             if let Ok(range) = book.worksheet_range(name) {
                 for (_, _, cell) in range.used_cells() {
-                    if e.content.len() >= LIMIT {
+                    if words.full() {
                         break;
                     }
-                    e.content.push(' ');
-                    e.content.extend(cell.to_string().to_lowercase().chars().take(512));
+                    words.add(&cell.to_string().to_lowercase().chars().take(512).collect::<String>());
                 }
+            }
+        }
+        e.content = words.text;
+    }
+}
+
+const CONTENT_LIMIT: usize = 128 * 1024;
+
+/// A file's text as its distinct words, each once. Search tokens never contain
+/// whitespace, so they match this exactly where they match the full text, and
+/// repeated labels and values no longer slow every search or use up the budget.
+#[derive(Default)]
+struct Words {
+    text: String,
+    seen: HashSet<String>,
+}
+
+impl Words {
+    fn full(&self) -> bool {
+        self.text.len() >= CONTENT_LIMIT
+    }
+
+    fn add(&mut self, text: &str) {
+        for word in text.split_whitespace() {
+            if self.full() {
+                return;
+            }
+            if !self.seen.contains(word) {
+                self.seen.insert(word.to_string());
+                if !self.text.is_empty() {
+                    self.text.push(' ');
+                }
+                self.text.push_str(word);
             }
         }
     }
@@ -584,6 +662,32 @@ mod tests {
     }
 
     #[test]
+    fn ranks_across_search_slices_like_one_pass() {
+        let mut items: Vec<(String, Kind)> = (0..3 * CHUNK).map(|i| (format!("file {i}.txt"), Kind::File)).collect();
+        items[10].0 = "budget old.xlsx".into();
+        items[2 * CHUNK + 5].0 = "budget.xlsx".into();
+        items[CHUNK + 7].0 = "tie a".into();
+        items[3].0 = "tie b".into();
+        let refs: Vec<(&str, Kind)> = items.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+        let index = idx(&refs);
+        let names = |q: &str, max| index.search(q, max, |_| 0).into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names("budget", 5), ["budget.xlsx", "budget old.xlsx"]);
+        assert_eq!(names("tie", 1), ["tie b"], "equal scores keep index order");
+        assert_eq!(names("file 1", 3).len(), 3);
+    }
+
+    #[test]
+    fn distinct_words_find_what_full_text_finds() {
+        let text = "q1 revenue 42000\tq2 revenue 42000\nprojected revenue total";
+        let mut words = Words::default();
+        words.add(text);
+        assert_eq!(words.text, "q1 revenue 42000 q2 projected total");
+        for token in ["rev", "venue", "42000", "q2", "total", "proj", "xyz", "q3"] {
+            assert_eq!(words.text.contains(token), text.contains(token), "{token}");
+        }
+    }
+
+    #[test]
     fn splits_filter_words_from_term() {
         assert_eq!(split_filter("excel bud"), ("excel ", "bud"));
         assert_eq!(split_filter("Mail  invoice q3"), ("Mail  ", "invoice q3"));
@@ -666,6 +770,43 @@ mod tests {
         assert_eq!(index.search("accounts", 8, |p| if p.ends_with("ps1xml") { 100 } else { 0 })[0].path, r"W:\Accounts");
         assert_eq!(index.search("excel accounts", 8, |_| 0)[0].name, "PPV accounts.xlsx");
         assert_eq!(index.search(r"W:\Accounts", 8, |_| 0)[0].kind as u8, Kind::Folder as u8);
+    }
+
+    /// Times searches over this PC's real profile. Run with
+    /// `cargo test --release -- --ignored --nocapture search_speed`.
+    #[test]
+    #[ignore]
+    fn search_speed() {
+        let start = Instant::now();
+        let mut list = start_apps();
+        profile_files(&mut list);
+        let walked = start.elapsed();
+        let mut content_bytes = 0;
+        for e in &mut list {
+            if content_bytes >= 32 * 1024 * 1024 {
+                break;
+            }
+            enrich(e);
+            content_bytes += e.content.len();
+        }
+        println!("{} entries, walk {walked:?}, content {} MB in {:?}", list.len(), content_bytes >> 20, start.elapsed() - walked);
+        let index = Index::default();
+        let without_content: Vec<Entry> = list.iter().map(|e| Entry { content: String::new(), ..e.clone() }).collect();
+        let bare = Index::default();
+        *bare.entries.write().unwrap() = Arc::new(without_content);
+        *index.entries.write().unwrap() = Arc::new(list);
+        rayon::broadcast(|_| ());
+        for q in ["b", "bu", "bud", "budget", "excel budget", "excel bud", "report 2026", "accounts", "zzqx", "zzqx yyqw"] {
+            let rounds = 20;
+            let time = |index: &Index| {
+                let start = Instant::now();
+                for _ in 0..rounds {
+                    std::hint::black_box(index.search(q, 7, |_| 0));
+                }
+                start.elapsed() / rounds
+            };
+            println!("{q:>14}: {:?} (names only {:?})", time(&index), time(&bare));
+        }
     }
 
     #[test]
