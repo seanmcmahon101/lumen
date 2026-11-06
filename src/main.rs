@@ -7,6 +7,7 @@ mod index;
 mod mail;
 mod tray;
 mod update;
+mod watch;
 mod win;
 
 use eframe::egui;

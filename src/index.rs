@@ -6,7 +6,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,6 +36,8 @@ pub struct Entry {
     location: String,
     content: String,
     pub detail: String,
+    stamp: (u64, u64, u32), // size, last write and attributes when scanned
+    read: bool,             // `content` reflects the file as of `stamp`
 }
 
 impl Entry {
@@ -49,8 +51,80 @@ impl Entry {
             depth: depth as u16,
             content: String::new(),
             detail: String::new(),
+            stamp: (0, 0, 0),
+            read: false,
         }
     }
+}
+
+/// Files created, renamed or deleted in watched folders since the last full scan.
+#[derive(Clone, Default)]
+struct Changes {
+    added: Vec<Entry>,
+    added_at: Vec<Instant>,
+    shadowed: HashSet<String>,         // locations of `added`, hiding the scanned copies
+    removed: HashMap<String, Instant>, // locations gone, with everything under them
+}
+
+impl Changes {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// A scanned entry that a later change replaced or deleted.
+    fn hides(&self, location: &str) -> bool {
+        self.shadowed.contains(location)
+            || (!self.removed.is_empty()
+                && std::path::Path::new(location).ancestors().any(|a| a.to_str().is_some_and(|a| self.removed.contains_key(a))))
+    }
+
+    fn add(&mut self, e: Entry, at: Instant) {
+        self.removed.remove(&e.location);
+        match self.added.iter().position(|a| a.location == e.location) {
+            Some(i) => (self.added[i], self.added_at[i]) = (e, at),
+            None => {
+                self.shadowed.insert(e.location.clone());
+                self.added.push(e);
+                self.added_at.push(at);
+            }
+        }
+    }
+
+    fn remove(&mut self, location: String, at: Instant) {
+        let folder = format!("{location}\\");
+        let mut i = 0;
+        while i < self.added.len() {
+            if self.added[i].location == location || self.added[i].location.starts_with(&folder) {
+                self.shadowed.remove(&self.added[i].location);
+                self.added.swap_remove(i);
+                self.added_at.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        self.removed.insert(location, at);
+    }
+
+    /// Forgets changes that a full scan started at `since` has seen for itself.
+    fn settle(&mut self, since: Instant) {
+        let mut i = 0;
+        while i < self.added.len() {
+            if self.added_at[i] < since {
+                self.shadowed.remove(&self.added[i].location);
+                self.added.swap_remove(i);
+                self.added_at.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        self.removed.retain(|_, at| *at >= since);
+    }
+}
+
+/// What a folder watch reports.
+pub enum Change {
+    Added(PathBuf),
+    Removed(PathBuf),
 }
 
 #[derive(Default)]
@@ -60,6 +134,7 @@ pub struct Index {
     building: AtomicBool,
     mapped: RwLock<HashMap<String, Arc<Vec<Entry>>>>,
     scanning_drives: Mutex<HashSet<String>>,
+    changes: RwLock<Arc<Changes>>,
 }
 
 impl Index {
@@ -98,34 +173,114 @@ impl Index {
         }
         let me = self.clone();
         std::thread::spawn(move || {
+            let publish = |list: Vec<Entry>| {
+                *me.entries.write().unwrap() = Arc::new(list);
+                me.generation.fetch_add(1, Ordering::Relaxed);
+                on_done();
+            };
+            let previous = me.entries.read().unwrap().clone();
             let mut list = start_apps();
             if list.is_empty() {
                 start_menu_shortcuts(&mut list);
             }
-            *me.entries.write().unwrap() = Arc::new(list.clone());
-            me.generation.fetch_add(1, Ordering::Relaxed);
-            on_done();
+            // The first scan shows apps at once; a refresh keeps searching the
+            // previous index until the new one is complete.
+            if previous.is_empty() {
+                publish(list.clone());
+            }
+            let walk_started = Instant::now();
             profile_files(&mut list);
-            *me.entries.write().unwrap() = Arc::new(list.clone());
-            me.generation.fetch_add(1, Ordering::Relaxed);
-            on_done();
-            let mut content_bytes = 0;
+            // Text read last time is still right for files that have not changed.
+            let mut content_bytes = reuse_content(&mut list, &previous);
+            drop(previous);
+            publish(list.clone());
+            me.update_changes(|changes| changes.settle(walk_started));
             for e in &mut list {
-                if content_bytes >= 32 * 1024 * 1024 {
+                if content_bytes >= CONTENT_BUDGET {
                     break;
                 }
-                enrich(e);
-                content_bytes += e.content.len();
+                if !e.read {
+                    enrich(e);
+                    content_bytes += e.content.len();
+                }
             }
-            *me.entries.write().unwrap() = Arc::new(list);
-            me.generation.fetch_add(1, Ordering::Relaxed);
+            publish(list);
             me.building.store(false, Ordering::Release);
             on_done();
         });
     }
 
+    /// Changes the overlay under its lock, so watchers on different folders cannot
+    /// overwrite each other, then has searches run again.
+    fn update_changes(&self, change: impl FnOnce(&mut Changes)) {
+        let mut current = self.changes.write().unwrap();
+        let mut next = (**current).clone();
+        change(&mut next);
+        *current = Arc::new(next);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Applies what a watch on `root` saw: names at once, then new workbook text.
+    pub fn apply(&self, root: &std::path::Path, changes: Vec<Change>, on_change: &dyn Fn()) {
+        let now = Instant::now();
+        // Read the disk first; the overlay is locked only to record the result.
+        let mut found: Vec<Result<Entry, String>> = Vec::new();
+        for change in changes {
+            match change {
+                Change::Removed(path) => found.push(Err(path.to_string_lossy().to_lowercase())),
+                Change::Added(path) => {
+                    let Some(depth) = watched_depth(root, &path) else { continue };
+                    let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let Some(e) = scanned_entry(name, &path, &md, depth) else { continue };
+                    let walk_in = e.kind == Kind::Folder && descends(&e.lower, depth, &md);
+                    found.push(Ok(e));
+                    // A folder moved or renamed in brings its contents.
+                    if walk_in {
+                        let mut inside = Vec::new();
+                        walk(VecDeque::from([(path, depth)]), &mut inside, 10_000);
+                        found.extend(inside.into_iter().map(Ok));
+                    }
+                }
+            }
+        }
+        let unread: Vec<Entry> = found.iter().flatten().filter(|e| e.kind == Kind::File && needs_reading(&e.lower)).cloned().collect();
+        self.update_changes(|changes| {
+            for item in found {
+                match item {
+                    Ok(e) => changes.add(e, now),
+                    Err(location) => changes.remove(location, now),
+                }
+            }
+        });
+        on_change();
+        if unread.is_empty() {
+            return;
+        }
+        // Saving a workbook replaces the file, so read the new text rather than lose it.
+        let read: Vec<Entry> = unread
+            .into_iter()
+            .map(|mut e| {
+                enrich(&mut e);
+                e
+            })
+            .collect();
+        self.update_changes(|changes| {
+            for e in read {
+                // Unless a newer change replaced it while the text was read.
+                if let Some(i) = changes.added.iter().position(|a| a.location == e.location && a.stamp == e.stamp) {
+                    changes.added[i] = e;
+                }
+            }
+        });
+        on_change();
+    }
+
     /// The indexed entry with this exact path.
     pub fn get(&self, path: &str) -> Option<Entry> {
+        if let Some(e) = self.changes.read().unwrap().added.iter().find(|e| e.path == path) {
+            return Some(e.clone());
+        }
         let entries = self.entries.read().unwrap().clone();
         if let Some(e) = entries.iter().find(|e| e.path == path) {
             return Some(e.clone());
@@ -172,13 +327,19 @@ impl Index {
         // Score small slices of the index on rayon's pool, which stays running between
         // searches (starting threads costs milliseconds on Windows) and lets idle cores
         // take slices from busy ones, since workbook text is unevenly spread.
-        let chunks: Vec<&[Entry]> = snapshots.iter().flat_map(|entries| entries.chunks(CHUNK)).collect();
+        // Scanned entries are checked against later changes; watched additions are not.
+        let changes = self.changes.read().unwrap().clone();
+        let hides = |e: &Entry| changes.hides(&e.location);
+        let check: Option<&(dyn Fn(&Entry) -> bool + Sync)> = (!changes.is_empty()).then_some(&hides);
+        let mut chunks: Vec<(&[Entry], Option<&(dyn Fn(&Entry) -> bool + Sync)>)> =
+            snapshots.iter().flat_map(|entries| entries.chunks(CHUNK)).map(|chunk| (chunk, check)).collect();
+        chunks.extend(changes.added.chunks(CHUNK).map(|chunk| (chunk, None)));
         let mut best: Vec<(i32, (usize, usize), &Entry)> = chunks
             .par_iter()
             .enumerate()
-            .flat_map_iter(|(k, chunk)| {
+            .flat_map_iter(|(k, &(chunk, hidden))| {
                 // (slice, position) keeps index order on equal scores.
-                best_in(chunk, &query, max, &uses).into_iter().map(move |(s, i, e)| (s, (k, i), e))
+                best_in(chunk, &query, max, &uses, hidden).into_iter().map(move |(s, i, e)| (s, (k, i), e))
             })
             .collect();
         best.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -196,8 +357,15 @@ struct Query<'a> {
     tokens: &'a [&'a str],
 }
 
-/// The best `max` entries of `entries` with their scores and positions.
-fn best_in<'e>(entries: &'e [Entry], q: &Query, max: usize, uses: &impl Fn(&str) -> u32) -> Vec<(i32, usize, &'e Entry)> {
+/// The best `max` entries of `entries` with their scores and positions, leaving out
+/// those `hidden` rejects (asked only of entries that would make the list).
+fn best_in<'e>(
+    entries: &'e [Entry],
+    q: &Query,
+    max: usize,
+    uses: &impl Fn(&str) -> u32,
+    hidden: Option<&(dyn Fn(&Entry) -> bool + Sync)>,
+) -> Vec<(i32, usize, &'e Entry)> {
     // A min-heap: the weakest kept result is on top, and on equal scores the later entry.
     let mut heap: BinaryHeap<Reverse<(i32, Reverse<usize>)>> = BinaryHeap::with_capacity(max + 1);
     for (i, e) in entries.iter().enumerate() {
@@ -230,12 +398,14 @@ fn best_in<'e>(entries: &'e [Entry], q: &Query, max: usize, uses: &impl Fn(&str)
         if u > 0 {
             s += (u.min(7) as i32 * 60).min(400);
         }
-        if heap.len() < max {
-            heap.push(Reverse((s, Reverse(i))));
-        } else if heap.peek().is_some_and(|Reverse((min, _))| s > *min) {
-            heap.pop();
-            heap.push(Reverse((s, Reverse(i))));
+        let makes_list = heap.len() < max || heap.peek().is_some_and(|Reverse((min, _))| s > *min);
+        if !makes_list || hidden.is_some_and(|hidden| hidden(e)) {
+            continue;
         }
+        if heap.len() == max {
+            heap.pop();
+        }
+        heap.push(Reverse((s, Reverse(i))));
     }
     heap.into_iter().map(|Reverse((s, Reverse(i)))| (s, i, &entries[i])).collect()
 }
@@ -430,15 +600,18 @@ fn one_edit_in<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     edits + (a.len() - i) + (b.len() - j) <= 1
 }
 
+/// Workbooks, CSV/TSV and saved mail have text to read.
+fn needs_reading(lower_name: &str) -> bool {
+    spreadsheet(lower_name) || extension(lower_name) == "eml"
+}
+
 // Never hydrate cloud placeholders while building the local content index.
 fn enrich(e: &mut Entry) {
-    if e.kind != Kind::File {
+    e.read = true;
+    if e.kind != Kind::File || !needs_reading(&e.lower) {
         return;
     }
     let ext = extension(&e.lower);
-    if !spreadsheet(&e.lower) && ext != "eml" {
-        return;
-    }
     let Ok(md) = std::fs::metadata(&e.path) else {
         return;
     };
@@ -481,6 +654,7 @@ fn enrich(e: &mut Entry) {
 }
 
 const CONTENT_LIMIT: usize = 128 * 1024;
+const CONTENT_BUDGET: usize = 32 * 1024 * 1024; // text kept across all files
 
 /// A file's text as its distinct words, each once. Search tokens never contain
 /// whitespace, so they match this exactly where they match the full text, and
@@ -582,19 +756,32 @@ fn start_menu_shortcuts(list: &mut Vec<Entry>) {
     }
 }
 
-/// Breadth-first walk of the user profile, so a hit cap drops the deepest files first.
-fn profile_files(list: &mut Vec<Entry>) {
-    let Ok(root) = std::env::var("USERPROFILE") else {
-        return;
-    };
-    let root = PathBuf::from(root);
-    let mut queue: VecDeque<_> = ["Documents", "Desktop", "Downloads"].iter().map(|name| (root.join(name), 0usize)).collect();
+/// The folders scanned first and watched for changes: Documents, Desktop, Downloads
+/// and OneDrive. The rest of the profile is scanned after them.
+pub fn scan_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        roots.extend(["Documents", "Desktop", "Downloads"].iter().map(|name| PathBuf::from(&profile).join(name)));
+    }
     for variable in ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] {
         if let Ok(path) = std::env::var(variable) {
-            queue.push_back((PathBuf::from(path), 0));
+            roots.push(PathBuf::from(path));
         }
     }
-    queue.push_back((root, 0));
+    roots
+}
+
+fn profile_files(list: &mut Vec<Entry>) {
+    let Ok(profile) = std::env::var("USERPROFILE") else {
+        return;
+    };
+    let mut queue: VecDeque<_> = scan_roots().into_iter().map(|dir| (dir, 0)).collect();
+    queue.push_back((PathBuf::from(profile), 0));
+    walk(queue, list, MAX_FILES);
+}
+
+/// Breadth-first walk, so a hit cap drops the deepest files first.
+fn walk(mut queue: VecDeque<(PathBuf, usize)>, list: &mut Vec<Entry>, limit: usize) {
     let mut visited = HashSet::new();
     let mut count = 0;
     while let Some((dir, depth)) = queue.pop_front() {
@@ -606,34 +793,63 @@ fn profile_files(list: &mut Vec<Entry>) {
         };
         for de in rd.flatten() {
             let name = de.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name.starts_with("~$") {
-                continue;
-            }
             let Ok(md) = de.metadata() else { continue };
-            if md.file_attributes() & HIDDEN_OR_SYSTEM != 0 {
-                continue;
-            }
-            let is_dir = md.is_dir();
             let path = de.path();
-            list.push(Entry::new(
-                name.clone(),
-                path.to_string_lossy().into_owned(),
-                if is_dir { Kind::Folder } else { Kind::File },
-                depth + 1,
-            ));
+            let Some(e) = scanned_entry(name, &path, &md, depth + 1) else { continue };
+            let descend = e.kind == Kind::Folder && descends(&e.lower, depth + 1, &md);
+            list.push(e);
             count += 1;
-            if count >= MAX_FILES {
+            if count >= limit {
                 return;
             }
-            if is_dir
-                && !de.file_type().is_ok_and(|t| t.is_symlink())
-                && depth + 1 < MAX_DEPTH
-                && !SKIP_DIRS.contains(&name.to_lowercase().as_str())
-            {
+            if descend {
                 queue.push_back((path, depth + 1));
             }
         }
     }
+}
+
+/// An entry for a file or folder on disk, unless Lumen leaves it out.
+fn scanned_entry(name: String, path: &Path, md: &std::fs::Metadata, depth: usize) -> Option<Entry> {
+    if name.starts_with('.') || name.starts_with("~$") || md.file_attributes() & HIDDEN_OR_SYSTEM != 0 {
+        return None;
+    }
+    let kind = if md.is_dir() { Kind::Folder } else { Kind::File };
+    let mut e = Entry::new(name, path.to_string_lossy().into_owned(), kind, depth);
+    e.stamp = (md.len(), md.last_write_time(), md.file_attributes());
+    Some(e)
+}
+
+/// The walk goes into this folder, found at `depth`.
+fn descends(lower_name: &str, depth: usize, md: &std::fs::Metadata) -> bool {
+    !md.file_type().is_symlink() && depth < MAX_DEPTH && !SKIP_DIRS.contains(&lower_name)
+}
+
+/// How deep the walk from `root` would find `path`, or None if it never goes there.
+fn watched_depth(root: &Path, path: &Path) -> Option<usize> {
+    let parts: Vec<String> =
+        path.strip_prefix(root).ok()?.components().map(|part| part.as_os_str().to_string_lossy().to_lowercase()).collect();
+    let (_, folders) = parts.split_last()?;
+    let skipped = folders.iter().any(|folder| folder.starts_with('.') || SKIP_DIRS.contains(&folder.as_str()));
+    (!skipped && parts.len() <= MAX_DEPTH).then_some(parts.len())
+}
+
+/// Copies text read by the previous scan into files whose size, date and attributes
+/// have not changed, and returns how much it copied.
+fn reuse_content(list: &mut [Entry], previous: &[Entry]) -> usize {
+    let known: HashMap<&str, &Entry> = previous.iter().filter(|e| e.read).map(|e| (e.path.as_str(), e)).collect();
+    let mut bytes = 0;
+    for e in list.iter_mut().filter(|e| e.kind == Kind::File) {
+        if let Some(old) = known.get(e.path.as_str())
+            && old.stamp == e.stamp
+        {
+            e.content = old.content.clone();
+            e.detail = old.detail.clone();
+            e.read = true;
+            bytes += e.content.len();
+        }
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -674,6 +890,62 @@ mod tests {
         assert_eq!(names("budget", 5), ["budget.xlsx", "budget old.xlsx"]);
         assert_eq!(names("tie", 1), ["tie b"], "equal scores keep index order");
         assert_eq!(names("file 1", 3).len(), 3);
+    }
+
+    #[test]
+    fn watched_changes_show_up_and_hide_what_they_replace() {
+        let root = std::env::temp_dir().join(format!("lumen-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Reports")).unwrap();
+        std::fs::write(root.join("Reports").join("q3 forecast.txt"), "x").unwrap();
+        let index = Index::default();
+        // The last full scan saw a file that has since been deleted.
+        let old = root.join("old plan.txt").to_string_lossy().into_owned();
+        *index.entries.write().unwrap() = Arc::new(vec![Entry::new("old plan.txt".into(), old, Kind::File, 1)]);
+        let names = |q: &str| index.search(q, 5, |_| 0).into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names("plan"), ["old plan.txt"]);
+
+        let changes = vec![
+            Change::Removed(root.join("old plan.txt")),
+            Change::Added(root.join("Reports")),
+            Change::Added(root.join("node_modules").join("plan.js")),
+        ];
+        index.apply(&root, changes, &|| ());
+        assert!(names("plan").is_empty(), "deleted, and node_modules is never indexed");
+        assert_eq!(names("forecast"), ["q3 forecast.txt"], "a folder that appears brings its files");
+
+        std::fs::rename(root.join("Reports"), root.join("Archive")).unwrap();
+        index.apply(&root, vec![Change::Removed(root.join("Reports")), Change::Added(root.join("Archive"))], &|| ());
+        let found = index.search("forecast", 5, |_| 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, root.join("Archive").join("q3 forecast.txt").to_string_lossy());
+        assert_eq!(index.get(&found[0].path).map(|e| e.name), Some("q3 forecast.txt".into()));
+
+        // A full scan that starts after these changes sees them for itself.
+        index.update_changes(|changes| changes.settle(Instant::now()));
+        assert!(index.changes.read().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refresh_reuses_text_only_of_unchanged_files() {
+        let scanned = |name: &str, stamp| {
+            let mut e = Entry::new(name.into(), format!(r"C:\nowhere\{name}"), Kind::File, 1);
+            e.stamp = stamp;
+            e
+        };
+        let previous: Vec<Entry> = ["same.xlsx", "edited.xlsx"]
+            .iter()
+            .map(|name| {
+                let mut e = scanned(name, (10, 20, 32));
+                (e.read, e.content) = (true, "cashflow".into());
+                e
+            })
+            .collect();
+        let mut list = vec![scanned("same.xlsx", (10, 20, 32)), scanned("edited.xlsx", (11, 25, 32))];
+        assert_eq!(reuse_content(&mut list, &previous), "cashflow".len());
+        assert!(list[0].read && list[0].content == "cashflow");
+        assert!(!list[1].read && list[1].content.is_empty(), "edited files are read again");
     }
 
     #[test]

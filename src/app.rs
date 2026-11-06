@@ -140,6 +140,8 @@ impl Lumen {
         });
         let repaint = ctx.clone();
         index.rebuild(move || repaint.request_repaint());
+        let repaint = ctx.clone();
+        crate::watch::spawn(index.clone(), move || repaint.request_repaint());
         let (search_tx, requests) = mpsc::channel::<(String, u64, win::History)>();
         let (answers, search_rx) = mpsc::channel();
         let latest_query = Arc::new(Mutex::new(String::new()));

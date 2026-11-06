@@ -57,6 +57,12 @@ by name and path only. Exact folder matches outrank incidental file prefixes. In
 15 minutes, with a 250,000-entry and 20-level traversal limit. Cloud-only files can
 match by filename; content indexing does not download them.
 
+Documents, Desktop, Downloads and OneDrive are watched: files created, renamed,
+moved or deleted there show up in search, or leave it, within about a second.
+A saved workbook's text is read again straight away. During the 15-minute refresh,
+search keeps using the previous index, and text from workbooks whose size, date
+and attributes have not changed is reused rather than read again.
+
 XLSX, XLS, XLSM, XLSB and ODS contents are read with Calamine; CSV/TSV text is also
 indexed. Each distinct word is kept once per file, so repeated labels and values
 do not use up the limits. Limits: 16 MB source file, first 32 worksheets, 128 KB of
