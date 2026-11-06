@@ -3,6 +3,11 @@ name: Windows release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package (for example v0.2.0)
+        required: true
 
 permissions:
   contents: write
@@ -13,8 +18,11 @@ jobs:
     timeout-minutes: 30
     env:
       RUSTFLAGS: '-C target-feature=+crt-static'
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Test and build
         run: |
@@ -26,7 +34,7 @@ jobs:
       - name: Build installer
         run: |
           $version = (cargo +stable metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($env:GITHUB_REF_NAME -cne "v$version") { throw 'Release tag must match Cargo.toml' }
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Release tag must match Cargo.toml' }
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
           $compiler = if ($iscc) { $iscc.Source } else { Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
           & $compiler "/DAppVersion=$version" installer/lumen.iss
@@ -49,4 +57,4 @@ jobs:
       - name: Publish installer
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME target/installer/Lumen-Setup-x64.exe --verify-tag --title "Lumen $env:GITHUB_REF_NAME" --generate-notes
+        run: gh release create $env:RELEASE_TAG target/installer/Lumen-Setup-x64.exe --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes
