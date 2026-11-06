@@ -3,7 +3,7 @@
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Update {
     pub version: String,
@@ -15,20 +15,29 @@ impl Update {
     }
 }
 
-pub fn watch(ctx: eframe::egui::Context) -> mpsc::Receiver<Update> {
+/// Checks at startup and every six hours. Send on the returned sender each time
+/// Lumen opens to check again if the last check was over an hour ago.
+pub fn watch(ctx: eframe::egui::Context) -> (mpsc::Receiver<Update>, mpsc::Sender<()>) {
     let (sender, receiver) = mpsc::channel();
+    let (opened_tx, opened) = mpsc::channel::<()>();
     std::thread::spawn(move || {
+        let mut last: Option<Instant> = None;
         loop {
-            if let Some(update) = check() {
-                if sender.send(update).is_err() {
-                    break;
+            if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(60 * 60)) {
+                last = Some(Instant::now());
+                if let Some(update) = check() {
+                    if sender.send(update).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
             }
-            std::thread::sleep(Duration::from_secs(6 * 60 * 60));
+            if let Err(mpsc::RecvTimeoutError::Disconnected) = opened.recv_timeout(Duration::from_secs(6 * 60 * 60)) {
+                break;
+            }
         }
     });
-    receiver
+    (receiver, opened_tx)
 }
 
 fn check() -> Option<Update> {

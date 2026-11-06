@@ -90,6 +90,7 @@ pub struct Lumen {
     backdrop: Option<TextureHandle>,
     display_overlay: win::DisplayOverlay,
     update_rx: mpsc::Receiver<crate::update::Update>,
+    update_opened: mpsc::Sender<()>,
     available_update: Option<crate::update::Update>,
     pinned: bool, // --show: stay open when focus leaves (testing)
     frames: u32,
@@ -198,6 +199,7 @@ impl Lumen {
         let args: Vec<String> = std::env::args().collect();
         let mut query = String::new();
         let pinned = args.iter().any(|a| a == "--show");
+        let (update_rx, update_opened) = crate::update::watch(ctx.clone());
         if let Some(i) = args.iter().position(|a| a == "--show") {
             query = args.get(i + 1).cloned().unwrap_or_default();
             std::thread::spawn(|| {
@@ -225,7 +227,8 @@ impl Lumen {
             profile: std::env::var("USERPROFILE").unwrap_or_default(),
             backdrop: None,
             display_overlay: win::DisplayOverlay::default(),
-            update_rx: crate::update::watch(ctx.clone()),
+            update_rx,
+            update_opened,
             available_update: None,
             pinned,
             frames: 0,
@@ -738,6 +741,7 @@ impl eframe::App for Lumen {
             return;
         }
         if win::JUST_SHOWN.swap(false, Ordering::Acquire) {
+            let _ = self.update_opened.send(());
             self.backdrop = self.display_overlay.open().map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
             if !win::VISIBLE.load(Ordering::Relaxed) {
                 self.hide();

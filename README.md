@@ -18,7 +18,8 @@ On multiple monitors, Lumen opens in the centre of the active app's display and
 dims the others until you close it. When the desktop has focus, Lumen uses the
 display under the pointer.
 
-Lumen checks GitHub for a newer installer at startup and every six hours. When
+Lumen checks GitHub for a newer installer at startup, every six hours, and when
+you open it if the last check was over an hour ago. When
 **Update available** appears, click it to open the release page and download
 the installer.
 
