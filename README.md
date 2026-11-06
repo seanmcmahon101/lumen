@@ -44,6 +44,11 @@ close a running Lumen for you.
 Settings and commands named exactly appear above files; partial names such as
 `blue` only fill rows that files leave empty.
 
+Source code and scripts (`.c`, `.go`, `.py`, `.bat`, `.ps1`…), and anything inside
+package caches, SDKs, vendored code or unpacked versioned releases (`go\pkg\mod`,
+`dotnet\sdk\10.0.203`, `Python-3.14.8`), rank below documents. They still appear
+when nothing better matches, or when typed by exact name.
+
 Each keystroke searches the whole index at once, split across every CPU core; on
 a profile of about 115,000 files and 32 MB of workbook text, a search takes 2–6 ms.
 The previous results stay on screen until the new ones arrive, and Enter pressed

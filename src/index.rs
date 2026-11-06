@@ -38,13 +38,16 @@ pub struct Entry {
     pub detail: String,
     stamp: (u64, u64, u32), // size, last write and attributes when scanned
     read: bool,             // `content` reflects the file as of `stamp`
+    penalty: u16,           // rank points taken off results seldom wanted
 }
 
 impl Entry {
     pub(crate) fn new(name: String, path: String, kind: Kind, depth: usize) -> Self {
+        let (lower, location) = (name.to_lowercase(), path.to_lowercase());
         Self {
-            lower: name.to_lowercase(),
-            location: path.to_lowercase(),
+            penalty: penalty(kind, &lower, &location),
+            lower,
+            location,
             name,
             path,
             kind,
@@ -55,6 +58,55 @@ impl Entry {
             read: false,
         }
     }
+}
+
+/// Source code, scripts and build output.
+const CODE_EXTENSIONS: &[&str] = &[
+    "c", "h", "cc", "cpp", "cxx", "hpp", "hxx", "inl", "go", "rs", "py", "pyc", "pyd", "pyi", "pyx", "js", "mjs", "cjs", "ts", "tsx", "jsx",
+    "java", "class", "kt", "cs", "vb", "rb", "php", "pl", "pm", "lua", "swift", "s", "asm", "bat", "cmd", "ps1", "psm1", "psd1", "ps1xml",
+    "sh", "mk", "cmake", "vcxproj", "filters", "props", "targets", "sln", "dll", "pdb", "lib", "obj", "o", "a", "so", "exp", "ilk", "def",
+    "rc", "map", "lock", "toml", "mod", "sum", "in", "am", "ac", "m4",
+];
+
+/// Code files, and anything inside a package cache, vendored code or an unpacked
+/// source release, are seldom what a search is for: they rank below documents but
+/// still appear when nothing better matches.
+fn penalty(kind: Kind, lower_name: &str, location: &str) -> u16 {
+    let mut penalty = 0;
+    if kind == Kind::File && lower_name.rsplit_once('.').is_some_and(|(_, ext)| CODE_EXTENSIONS.contains(&ext)) {
+        penalty += 300;
+    }
+    if matches!(kind, Kind::File | Kind::Folder) && in_dependency_tree(location) {
+        penalty += 300;
+    }
+    penalty
+}
+
+/// Below go\pkg\mod, vendor, third_party, testdata, externals or an SDK, or below
+/// a versioned folder such as libc@v1.55.3, Python-3.14.8 or 10.0.203.
+fn in_dependency_tree(location: &str) -> bool {
+    let Some((parent, _)) = location.rsplit_once('\\') else { return false };
+    format!("{parent}\\").contains("\\pkg\\mod\\")
+        || parent.split('\\').any(|folder| {
+            matches!(folder, "vendor" | "third_party" | "third-party" | "testdata" | "externals" | "sdk" | "sdks") || versioned(folder)
+        })
+}
+
+/// A dotted version, alone or after a name and @ or -: "10.0.203", "libc@v1.55.3",
+/// "python-3.14.8". Alone it needs three parts and a short first part, so dates
+/// such as 2024.01.15 do not count.
+fn versioned(folder: &str) -> bool {
+    let parts: Vec<&str> = folder.split('.').collect();
+    if parts.len() >= 3 && parts[0].len() <= 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return true;
+    }
+    !folder.contains(' ')
+        && folder.match_indices(['@', '-']).any(|(i, _)| {
+            let rest = &folder[i + 1..];
+            let rest = rest.strip_prefix('v').unwrap_or(rest);
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && rest[digits..].starts_with('.') && rest.as_bytes().get(digits + 1).is_some_and(u8::is_ascii_digit)
+        })
 }
 
 /// Files created, renamed or deleted in watched folders since the last full scan.
@@ -385,9 +437,7 @@ fn best_in<'e>(
         if e.kind == Kind::Folder && (e.lower == q.needle || e.location == q.needle) {
             s += 1000;
         }
-        if e.kind == Kind::File && matches!(extension(&e.lower), "ps1xml" | "psd1" | "psm1" | "dll" | "pdb") {
-            s -= 300;
-        }
+        s -= e.penalty as i32;
         s += match e.kind {
             Kind::App => 200,
             Kind::Folder => 40,
@@ -949,6 +999,34 @@ mod tests {
     }
 
     #[test]
+    fn code_and_package_files_rank_below_documents_but_still_appear() {
+        let entry = |path: &str, kind| Entry::new(path.rsplit('\\').next().unwrap().into(), path.into(), kind, 3);
+        let index = Index::default();
+        *index.entries.write().unwrap() = Arc::new(vec![
+            entry(r"C:\Users\u\go\pkg\mod\modernc.org\libc@v1.55.3\src\env.c", Kind::File),
+            entry(r"C:\Users\u\Downloads\Python-3.14.8\PCbuild\env.bat", Kind::File),
+            entry(r"W:\Accounts\BL2\Environmental Costs", Kind::Folder),
+            entry(r"C:\Users\u\Documents\env notes.docx", Kind::File),
+        ]);
+        let names: Vec<String> = index.search("env", 8, |_| 0).into_iter().map(|e| e.name).collect();
+        assert_eq!(names[..2], ["Environmental Costs", "env notes.docx"]);
+        assert_eq!(names.len(), 4, "code files are ranked down, not hidden");
+        assert_eq!(index.search("env.bat", 8, |_| 0)[0].name, "env.bat", "named exactly, it still comes first");
+    }
+
+    #[test]
+    fn recognizes_versioned_package_folders() {
+        for folder in ["python-3.14.8", "libc@v1.55.3", "toolchain@v0.0.1-go1.26.10.windows-amd64", "node-v20.1.0", "10.0.203", "8.0.420"] {
+            assert!(versioned(folder), "{folder}");
+        }
+        for folder in ["2024-01-15", "2024.01.15", "1.2", "fy2024-25", "q3 report-1.2", "accounts", "v1.2", "budget-"] {
+            assert!(!versioned(folder), "{folder}");
+        }
+        assert!(in_dependency_tree(r"c:\users\u\go\pkg\mod\cache\download\x.zip"));
+        assert!(!in_dependency_tree(r"c:\users\u\documents\pkg\mods.xlsx"));
+    }
+
+    #[test]
     fn distinct_words_find_what_full_text_finds() {
         let text = "q1 revenue 42000\tq2 revenue 42000\nprojected revenue total";
         let mut words = Words::default();
@@ -1062,6 +1140,9 @@ mod tests {
             content_bytes += e.content.len();
         }
         println!("{} entries, walk {walked:?}, content {} MB in {:?}", list.len(), content_bytes >> 20, start.elapsed() - walked);
+        let code = list.iter().filter(|e| e.penalty % 600 == 300 && !in_dependency_tree(&e.location)).count();
+        let packaged = list.iter().filter(|e| in_dependency_tree(&e.location)).count();
+        println!("ranked down: {code} code files elsewhere, {packaged} entries in package trees");
         let index = Index::default();
         let without_content: Vec<Entry> = list.iter().map(|e| Entry { content: String::new(), ..e.clone() }).collect();
         let bare = Index::default();
