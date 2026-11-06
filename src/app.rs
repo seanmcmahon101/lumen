@@ -3,31 +3,34 @@
 use crate::index::{Entry, Index, Kind};
 use crate::{calc, win};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Layout, Margin,
-    Modifiers, Pos2, Rect, RichText, Sense, Shadow, TextEdit, TextureHandle, TextureOptions, UiBuilder, Vec2, pos2,
+    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Layout, Margin, Modifiers, Pos2,
+    Rect, RichText, Sense, Shadow, TextEdit, TextureHandle, TextureOptions, UiBuilder, Vec2, pos2,
     text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping},
     vec2,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 const TEXT: Color32 = Color32::from_rgb(0x16, 0x18, 0x1C);
-const SUBTLE: Color32 = Color32::from_rgb(0x86, 0x8B, 0x94);
-const HINT: Color32 = Color32::from_rgb(0xA3, 0xA8, 0xB0);
+const SUBTLE: Color32 = Color32::from_rgb(0x63, 0x69, 0x73);
+const HINT: Color32 = Color32::from_rgb(0x68, 0x6E, 0x78);
 const GHOST: Color32 = Color32::from_rgb(0xB4, 0xB8, 0xBF);
 const SELECTED: Color32 = Color32::from_rgb(0xEB, 0xEE, 0xF3);
 const HOVER: Color32 = Color32::from_rgb(0xF4, 0xF5, 0xF8);
 const DIVIDER: Color32 = Color32::from_rgb(0xEC, 0xED, 0xF0);
 const GLYPH_BG: Color32 = Color32::from_rgb(0xF0, 0xF1, 0xF4);
 
-const WIDTH: f32 = 680.0;
-const BAR_H: f32 = 64.0;
-const ROW_H: f32 = 50.0;
+const WIDTH: f32 = 760.0;
+const BAR_H: f32 = 80.0;
+const FILTER_H: f32 = 44.0;
+const TEXT_INSET: f32 = 68.0;
+const SEARCH_SIZE: f32 = 26.0;
+const ROW_H: f32 = 64.0;
 const LIST_PAD: f32 = 6.0;
-const FOOTER_H: f32 = 32.0;
+const FOOTER_H: f32 = 40.0;
 const MAX_ROWS: usize = 8;
 const RADIUS: u8 = 18;
 
@@ -73,9 +76,13 @@ pub struct Lumen {
     last_generation: u64,
     results: Vec<Item>,
     selected: usize,
+    selection_by_user: bool,
     index: Arc<Index>,
     history: win::History,
     icons: HashMap<String, Option<TextureHandle>>,
+    icon_tx: mpsc::Sender<(String, String)>,
+    icon_rx: mpsc::Receiver<(String, Option<egui::ColorImage>)>,
+    pending_icons: HashSet<String>,
     seen_focus: bool,
     ghost_shown: bool,
     startup: bool,
@@ -83,6 +90,13 @@ pub struct Lumen {
     backdrop: Option<TextureHandle>,
     pinned: bool, // --show: stay open when focus leaves (testing)
     frames: u32,
+    search_tx: mpsc::Sender<(String, u64, win::History)>,
+    search_rx: mpsc::Receiver<(String, u64, Vec<Entry>, String)>,
+    search_key: Option<(String, u64)>,
+    found: Vec<Entry>,
+    searching: bool,
+    search_note: String,
+    latest_query: Arc<Mutex<String>>,
 }
 
 impl Lumen {
@@ -100,14 +114,69 @@ impl Lumen {
         }
 
         let index = Arc::new(Index::default());
+        let (icon_tx, icon_requests) = mpsc::channel::<(String, String)>();
+        let (icon_answers, icon_rx) = mpsc::channel();
+        let icon_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let initialized =
+                unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED).is_ok() };
+            while let Ok((key, path)) = icon_requests.recv() {
+                let icon = win::load_icon(&path);
+                if icon_answers.send((key, icon)).is_err() {
+                    break;
+                }
+                icon_ctx.request_repaint();
+            }
+            if initialized {
+                unsafe {
+                    windows::Win32::System::Com::CoUninitialize();
+                }
+            }
+        });
         let repaint = ctx.clone();
         index.rebuild(move || repaint.request_repaint());
+        let (search_tx, requests) = mpsc::channel::<(String, u64, win::History)>();
+        let (answers, search_rx) = mpsc::channel();
+        let latest_query = Arc::new(Mutex::new(String::new()));
+        let worker_query = latest_query.clone();
+        let (search_index, search_ctx) = (index.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                std::thread::sleep(Duration::from_millis(70));
+                while let Ok(newer) = requests.try_recv() {
+                    request = newer;
+                }
+                let (q, generation, history) = request;
+                let mut found = search_index.search(&q, MAX_ROWS - 1, |p| history.uses(p));
+                let mut note = String::new();
+                if let Some(term) = crate::mail::query(&q) {
+                    match crate::mail::search(term, || *worker_query.lock().unwrap() != q) {
+                        Ok(mail) => {
+                            note = if mail.is_empty() {
+                                "No indexed Outlook matches · try Outlook online"
+                            } else {
+                                "Outlook results from this PC"
+                            }
+                            .into();
+                            found.splice(0..0, mail);
+                        }
+                        Err(_) => note = "Outlook index unavailable · try Outlook online".into(),
+                    }
+                }
+                if answers.send((q, generation, found, note)).is_err() {
+                    break;
+                }
+                search_ctx.request_repaint();
+            }
+        });
         // Refresh the index every 15 minutes.
         let (idx, c) = (index.clone(), ctx.clone());
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(15 * 60));
-            let c2 = c.clone();
-            idx.rebuild(move || c2.request_repaint());
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(15 * 60));
+                let c2 = c.clone();
+                idx.rebuild(move || c2.request_repaint());
+            }
         });
 
         crate::hook::spawn(win::toggle);
@@ -130,9 +199,13 @@ impl Lumen {
             last_generation: 0,
             results: Vec::new(),
             selected: 0,
+            selection_by_user: false,
             index,
             history: win::History::load(),
             icons: HashMap::new(),
+            icon_tx,
+            icon_rx,
+            pending_icons: HashSet::new(),
             seen_focus: false,
             ghost_shown: false,
             startup: win::startup_enabled(),
@@ -140,6 +213,13 @@ impl Lumen {
             backdrop: None,
             pinned,
             frames: 0,
+            search_tx,
+            search_rx,
+            search_key: None,
+            found: Vec::new(),
+            searching: false,
+            search_note: String::new(),
+            latest_query,
         }
     }
 
@@ -158,11 +238,7 @@ impl Lumen {
     fn set_cursor(&self, ctx: &egui::Context, select_all: bool) {
         let len = self.query.chars().count();
         let mut state = TextEdit::load_state(ctx, Self::query_id()).unwrap_or_default();
-        let range = if select_all {
-            CCursorRange::two(CCursor::new(0), CCursor::new(len))
-        } else {
-            CCursorRange::one(CCursor::new(len))
-        };
+        let range = if select_all { CCursorRange::two(CCursor::new(0), CCursor::new(len)) } else { CCursorRange::one(CCursor::new(len)) };
         state.cursor.set_char_range(Some(range));
         state.store(ctx, Self::query_id());
     }
@@ -172,11 +248,25 @@ impl Lumen {
     }
 
     fn refresh(&mut self) {
+        let same_query = self.search_key.as_ref().is_some_and(|(query, _)| query == &self.query);
+        let previous_selection = (same_query && self.selection_by_user).then(|| self.results.get(self.selected).map(|item| (item.title.clone(), item.subtitle.clone()))).flatten();
+        if !same_query { self.selection_by_user = false; }
         self.last_query = Some(self.query.clone());
         self.last_generation = self.index.generation();
         self.results.clear();
         self.selected = 0;
         let t = self.query.trim().to_string();
+        let key = (self.query.clone(), self.last_generation);
+        if self.search_key.as_ref() != Some(&key) {
+            *self.latest_query.lock().unwrap() = self.query.clone();
+            if self.search_key.as_ref().is_none_or(|previous| previous.0 != key.0) {
+                self.found.clear();
+                self.search_note.clear();
+            }
+            self.search_key = Some(key.clone());
+            self.searching = !t.is_empty();
+            let _ = self.search_tx.send((key.0, key.1, self.history.clone()));
+        }
         if t.is_empty() {
             return;
         }
@@ -202,7 +292,7 @@ impl Lumen {
         if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
             let url = if lower.starts_with("www.") { format!("https://{t}") } else { t.clone() };
             self.results.push(simple(&format!("Open {t}"), "Website", "Web", G_GLOBE, Action::Open(url)));
-        } else if t.len() >= 3 && t.as_bytes()[1] == b':' && std::path::Path::new(&t).exists() {
+        } else if t.len() >= 3 && t.as_bytes()[1] == b':' {
             let mut it = simple(&t, "Open this location", "Path", G_OPEN, Action::Open(t.clone()));
             it.reveal = Some(t.clone());
             it.copy = Some(t.clone());
@@ -212,9 +302,7 @@ impl Lumen {
         let mut commands = Vec::new();
         if lower.chars().count() >= 3 {
             let startup_title = if self.startup { "Stop starting Lumen at login" } else { "Start Lumen at login" };
-            for (title, glyph, action) in
-                [("Quit Lumen", G_POWER, Action::Quit), (startup_title, G_SETTINGS, Action::ToggleStartup)]
-            {
+            for (title, glyph, action) in [("Quit Lumen", G_POWER, Action::Quit), (startup_title, G_SETTINGS, Action::ToggleStartup)] {
                 if title.to_lowercase().split_whitespace().any(|w| w.starts_with(&lower)) || title.to_lowercase().contains(&lower) {
                     commands.push(simple(title, "Lumen", "Command", glyph, action));
                 }
@@ -222,15 +310,28 @@ impl Lumen {
         }
 
         let room = MAX_ROWS.saturating_sub(self.results.len() + commands.len() + 1);
-        let history = &self.history;
-        for e in self.index.search(&t, room, |p| history.uses(p)) {
+        for e in self.found.iter().take(room).cloned() {
             let item = self.entry_item(e);
             self.results.push(item);
         }
         self.results.extend(commands);
 
-        let url = format!("https://www.google.com/search?q={}", url_encode(&t));
-        self.results.push(simple(&format!("Search the web for \u{201C}{t}\u{201D}"), "Google", "Web", G_SEARCH, Action::Open(url)));
+        if let Some(term) = crate::mail::query(&t) {
+            let url = format!("https://outlook.office.com/mail/0/search?q={}", url_encode(term));
+            self.results.push(simple(
+                "Search Outlook online",
+                "Microsoft 365 · opens in your browser",
+                "Outlook",
+                G_GLOBE,
+                Action::Open(url),
+            ));
+        } else {
+            let url = format!("https://www.google.com/search?q={}", url_encode(&t));
+            self.results.push(simple(&format!("Search the web for \u{201C}{t}\u{201D}"), "Google", "Web", G_SEARCH, Action::Open(url)));
+        }
+        if let Some((title, subtitle)) = previous_selection {
+            self.selected = self.results.iter().position(|item| item.title == title && item.subtitle == subtitle).unwrap_or(0);
+        }
     }
 
     fn entry_item(&self, e: Entry) -> Item {
@@ -241,7 +342,11 @@ impl Lumen {
         } else {
             e.name.clone()
         };
-        let subtitle = if is_app {
+        let subtitle = if e.kind == Kind::Email {
+            e.detail.clone()
+        } else if !e.detail.is_empty() {
+            format!("{} · {}", e.detail, e.path)
+        } else if is_app {
             "Application".to_string()
         } else {
             let parent = std::path::Path::new(&e.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -254,12 +359,14 @@ impl Lumen {
         let label = match e.kind {
             Kind::App => "App".into(),
             Kind::Folder => "Folder".into(),
+            Kind::Email => "Outlook".into(),
             Kind::File if !ext.is_empty() && ext.len() <= 5 => ext.to_uppercase(),
             Kind::File => "File".into(),
         };
         let key = match e.kind {
             Kind::Folder => "<folder>".to_string(),
             Kind::App => e.path.clone(),
+            Kind::Email => "<email>".into(),
             Kind::File if matches!(ext.as_str(), "" | "exe" | "lnk" | "url" | "ico" | "appref-ms") => e.path.clone(),
             Kind::File => format!("ext:{ext}"),
         };
@@ -267,11 +374,11 @@ impl Lumen {
             title,
             subtitle,
             label,
-            glyph: None,
-            icon: Some((key, e.path.clone())),
+            glyph: (e.kind == Kind::Email).then_some('\u{E715}'),
+            icon: (e.kind != Kind::Email).then(|| (key, e.path.clone())),
             action: Action::Open(e.path.clone()),
-            reveal: (!is_app).then(|| e.path.clone()),
-            admin: e.kind != Kind::Folder,
+            reveal: (!is_app && e.kind != Kind::Email).then(|| e.path.clone()),
+            admin: is_app || ext == "exe",
             copy: (!is_app).then(|| e.path.clone()),
             complete: Some(e.name.clone()),
             history_key: Some(e.path),
@@ -305,6 +412,9 @@ impl Lumen {
             (Mode::Admin, _, Action::Open(target)) if item.admin => {
                 win::shell_open(target, "runas", None);
             }
+            (_, _, Action::Open(target)) if target.starts_with("lumen-outlook:") => {
+                crate::mail::open(target);
+            }
             (_, _, Action::Open(target)) => {
                 win::shell_open(target, "open", None);
             }
@@ -318,6 +428,7 @@ impl Lumen {
         if let Some(k) = item.history_key.clone() {
             self.history.bump(&k);
         }
+        self.search_key = None;
         self.last_query = None; // re-rank next time
     }
 
@@ -325,14 +436,18 @@ impl Lumen {
         if let Some(t) = self.icons.get(key) {
             return t.clone();
         }
+        if self.pending_icons.contains(key) {
+            return None;
+        }
         if *budget == 0 {
             ctx.request_repaint();
             return None;
         }
         *budget -= 1;
-        let tex = win::load_icon(path).map(|img| ctx.load_texture(key, img, TextureOptions::LINEAR));
-        self.icons.insert(key.to_string(), tex.clone());
-        tex
+        if self.pending_icons.insert(key.to_string()) {
+            let _ = self.icon_tx.send((key.to_string(), path.to_string()));
+        }
+        None
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -346,9 +461,11 @@ impl Lumen {
                 run = Some(None);
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowDown) && n > 0 {
+                self.selection_by_user = true;
                 self.selected = (self.selected + 1).min(n - 1);
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                self.selection_by_user = true;
                 self.selected = self.selected.saturating_sub(1);
             }
             if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Enter) {
@@ -383,14 +500,19 @@ impl Lumen {
         let screen = ui.max_rect();
         let painter = ui.painter().clone();
         match &self.backdrop {
-            Some(tex) => painter.image(tex.id(), screen, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::from_gray(120)),
-            None => painter.rect_filled(screen, 0, Color32::from_gray(40)),
+            Some(tex) => painter.image(tex.id(), screen, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::from_gray(76)),
+            None => painter.rect_filled(screen, 0, Color32::from_gray(24)),
         };
 
-        let rows = self.results.len();
+        let available_rows =
+            ((screen.height() - 32.0 - BAR_H - FILTER_H - FOOTER_H - LIST_PAD * 2.0 - 1.0) / ROW_H).floor().max(1.0) as usize;
+        let rows = self.results.len().min(available_rows);
+        // Keep keyboard selection visible on short displays.
+        let first_row = self.selected.saturating_sub(rows.saturating_sub(1));
         let w = WIDTH.min(screen.width() - 40.0);
-        let h = BAR_H + if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 0.0 };
-        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.top() + screen.height() * 0.22), vec2(w, h));
+        let h = BAR_H + FILTER_H + if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 48.0 };
+        let top = (screen.top() + screen.height() * 0.22).min(screen.bottom() - h - 16.0).max(screen.top() + 16.0);
+        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, top), vec2(w, h));
 
         // Click on the dimmed area closes.
         if ui.interact(screen, Id::unique("dim"), Sense::click()).clicked()
@@ -402,15 +524,15 @@ impl Lumen {
 
         // Glow: a wide soft halo plus a tighter bright rim.
         let r = CornerRadius::same(RADIUS);
-        painter.add(Shadow { offset: [0, 0], blur: 90, spread: 8, color: Color32::from_white_alpha(60) }.as_shape(panel, r));
-        painter.add(Shadow { offset: [0, 0], blur: 26, spread: 1, color: Color32::from_white_alpha(120) }.as_shape(panel, r));
+        painter.add(Shadow { offset: [0, 0], blur: 90, spread: 8, color: Color32::from_white_alpha(86) }.as_shape(panel, r));
+        painter.add(Shadow { offset: [0, 0], blur: 26, spread: 2, color: Color32::from_white_alpha(164) }.as_shape(panel, r));
         painter.rect_filled(panel, r, Color32::WHITE);
 
         // Search bar
         let bar = Rect::from_min_size(panel.min, vec2(w, BAR_H));
-        painter.text(pos2(bar.left() + 26.0, bar.center().y), Align2::LEFT_CENTER, G_SEARCH, icon_font(18.0), SUBTLE);
-        let text_rect = Rect::from_min_max(pos2(bar.left() + 58.0, bar.top()), pos2(bar.right() - 24.0, bar.bottom()));
-        let font = FontId::proportional(22.0);
+        painter.text(pos2(bar.left() + 36.0, bar.center().y), Align2::CENTER_CENTER, G_SEARCH, icon_font(22.0), SUBTLE);
+        let text_rect = Rect::from_min_max(pos2(bar.left() + TEXT_INSET, bar.top()), pos2(bar.right() - 24.0, bar.bottom()));
+        let font = FontId::proportional(SEARCH_SIZE);
         let output = ui
             .scope_builder(UiBuilder::new().max_rect(text_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
                 TextEdit::singleline(&mut self.query)
@@ -419,7 +541,7 @@ impl Lumen {
                     .margin(Margin::ZERO)
                     .font(font.clone())
                     .text_color(TEXT)
-                    .hint_text(RichText::new("Search apps, files, or calculate").color(HINT))
+                    .hint_text(RichText::new("Find a file, spreadsheet, or email").font(font.clone()).color(HINT))
                     .desired_width(text_rect.width())
                     .lock_focus(true)
                     .show(ui)
@@ -432,24 +554,63 @@ impl Lumen {
         // Inline autocomplete: grey remainder of the selected result after the caret.
         let (at_end, has_selection) = self.caret(&ctx);
         self.ghost_shown = false;
-        if at_end && !has_selection && let Some(rest) = self.completion() {
+        if at_end
+            && !has_selection
+            && let Some(rest) = self.completion()
+        {
             let pos = output.galley_pos + vec2(output.galley.size().x, 0.0);
-            painter.text(pos, Align2::LEFT_TOP, rest, font, GHOST);
+            painter.with_clip_rect(text_rect).text(pos, Align2::LEFT_TOP, rest, font, GHOST);
             self.ghost_shown = true;
         }
 
+        let filters = Rect::from_min_size(pos2(panel.left() + 18.0, bar.bottom()), vec2(w - 36.0, FILTER_H));
+        ui.scope_builder(UiBuilder::new().max_rect(filters).layout(Layout::left_to_right(Align::Center)), |ui| {
+            for (label, prefix) in [("All", ""), ("Spreadsheets", "excel "), ("Outlook", "mail ")] {
+                let active = if prefix.is_empty() {
+                    !self.query.starts_with("excel ") && crate::mail::query(&self.query).is_none()
+                } else {
+                    self.query.starts_with(prefix)
+                };
+                if ui.selectable_label(active, RichText::new(label).size(16.0)).clicked() {
+                    let term =
+                        self.query.strip_prefix("excel ").or_else(|| crate::mail::query(&self.query)).unwrap_or(&self.query).to_string();
+                    self.query = format!("{prefix}{term}");
+                    self.set_cursor(&ctx, false);
+                }
+            }
+            let status = if self.searching && self.found.is_empty() {
+                Some("Searching…")
+            } else if self.query.trim().is_empty() && self.index.is_building() {
+                Some("Indexing…")
+            } else {
+                None
+            };
+            if let Some(status) = status {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(status).size(14.0).color(SUBTLE));
+                });
+            }
+        });
         if rows == 0 {
+            painter.text(
+                pos2(panel.left() + TEXT_INSET, panel.bottom() - 24.0),
+                Align2::LEFT_CENTER,
+                "Try excel budget, a sheet name, or mail invoice",
+                FontId::proportional(15.0),
+                SUBTLE,
+            );
             return;
         }
-        painter.hline(panel.x_range(), bar.bottom(), (1.0, DIVIDER));
+        painter.hline(panel.x_range(), bar.bottom() + FILTER_H, (1.0, DIVIDER));
 
         let mut budget = 3; // icon loads per frame
         let mut clicked = None;
-        let mut y = bar.bottom() + 1.0 + LIST_PAD;
-        for i in 0..rows {
+        let mut y = bar.bottom() + FILTER_H + 1.0 + LIST_PAD;
+        for i in first_row..first_row + rows {
             let row = Rect::from_min_size(pos2(panel.left() + 8.0, y), vec2(w - 16.0, ROW_H));
             y += ROW_H;
             let resp = ui.interact(row, Id::unique(("row", i)), Sense::click());
+            resp.clone().on_hover_text(&self.results[i].subtitle);
             if i == self.selected {
                 painter.rect_filled(row, 10, SELECTED);
             } else if resp.hovered() {
@@ -459,11 +620,11 @@ impl Lumen {
                 clicked = Some(i);
             }
 
-            let icon_rect = Rect::from_center_size(pos2(row.left() + 26.0, row.center().y), Vec2::splat(28.0));
+            let icon_rect = Rect::from_center_size(pos2(row.left() + 28.0, row.center().y), Vec2::splat(32.0));
             let (glyph, icon) = (self.results[i].glyph, self.results[i].icon.clone());
             if let Some(g) = glyph {
                 painter.rect_filled(icon_rect, 7, GLYPH_BG);
-                painter.text(icon_rect.center(), Align2::CENTER_CENTER, g, icon_font(15.0), TEXT);
+                painter.text(icon_rect.center(), Align2::CENTER_CENTER, g, icon_font(18.0), TEXT);
             } else if let Some((key, path)) = icon
                 && let Some(tex) = self.icon(&ctx, &key, &path, &mut budget)
             {
@@ -471,29 +632,35 @@ impl Lumen {
             }
 
             let item = &self.results[i];
-            let label = painter.text(
-                pos2(row.right() - 14.0, row.center().y),
-                Align2::RIGHT_CENTER,
-                &item.label,
-                FontId::proportional(12.0),
-                HINT,
-            );
-            let text_x = row.left() + 54.0;
+            let label =
+                painter.text(pos2(row.right() - 14.0, row.center().y), Align2::RIGHT_CENTER, &item.label, FontId::proportional(14.0), HINT);
+            let text_x = panel.left() + TEXT_INSET;
             let max_w = label.left() - text_x - 16.0;
-            let title = painter.layout_job(single_line(&item.title, 15.0, TEXT, max_w));
-            let sub = painter.layout_job(single_line(&item.subtitle, 12.0, SUBTLE, max_w));
-            let top = row.center().y - (title.size().y + sub.size().y) / 2.0;
+            let title = painter.layout_job(single_line(&item.title, 19.0, TEXT, max_w));
+            let sub = painter.layout_job(single_line(&item.subtitle, 15.0, SUBTLE, max_w));
+            let top = row.center().y - (title.size().y + 3.0 + sub.size().y) / 2.0;
             painter.galley(pos2(text_x, top), title.clone(), TEXT);
-            painter.galley(pos2(text_x, top + title.size().y), sub, SUBTLE);
+            painter.galley(pos2(text_x, top + title.size().y + 3.0), sub, SUBTLE);
         }
 
         // Key hints
         let mut x = panel.left() + 22.0;
         let fy = panel.bottom() - FOOTER_H / 2.0;
         painter.hline(panel.x_range(), panel.bottom() - FOOTER_H, (1.0, DIVIDER));
-        for (key, what) in [("Enter", "Open"), ("Ctrl+Enter", "Show in folder"), ("Tab", "Complete"), ("Ctrl+C", "Copy")] {
-            let k = painter.text(pos2(x, fy), Align2::LEFT_CENTER, key, FontId::proportional(11.5), SUBTLE);
-            let d = painter.text(pos2(k.right() + 5.0, fy), Align2::LEFT_CENTER, what, FontId::proportional(11.5), HINT);
+        let hints = if !self.search_note.is_empty() {
+            vec![("", self.search_note.as_str())]
+        } else {
+            let selected = self.results.get(self.selected);
+            let copy_action = selected.is_some_and(|item| matches!(item.action, Action::Copy(_)));
+            let mut hints = vec![("Enter", if copy_action { "Copy answer" } else { "Open" })];
+            if selected.is_some_and(|item| item.reveal.is_some()) { hints.push(("Ctrl+Enter", "Show in folder")); }
+            if selected.is_some_and(|item| item.complete.is_some()) { hints.push(("Tab", "Complete")); }
+            hints.push(("Esc", "Close"));
+            hints
+        };
+        for (key, what) in hints {
+            let k = painter.text(pos2(x, fy), Align2::LEFT_CENTER, key, FontId::proportional(14.0), SUBTLE);
+            let d = painter.text(pos2(k.right() + 5.0, fy), Align2::LEFT_CENTER, what, FontId::proportional(14.0), HINT);
             x = d.right() + 18.0;
         }
 
@@ -531,6 +698,21 @@ impl eframe::App for Lumen {
             return;
         }
 
+        while let Ok((q, generation, found, note)) = self.search_rx.try_recv() {
+            if q == self.query && generation <= self.index.generation() {
+                self.found = found;
+                self.search_note = note;
+                self.searching = false;
+                self.last_query = None;
+            }
+        }
+
+        while let Ok((key, image)) = self.icon_rx.try_recv() {
+            self.pending_icons.remove(&key);
+            let texture = image.map(|img| ctx.load_texture(&key, img, TextureOptions::LINEAR));
+            self.icons.insert(key, texture);
+        }
+
         // Clicking another window closes the launcher.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
         if focused {
@@ -548,7 +730,6 @@ impl eframe::App for Lumen {
         if self.last_query.as_deref() != Some(self.query.as_str()) {
             self.refresh(); // Tab completion changed the text
         }
-
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

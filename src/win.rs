@@ -208,6 +208,7 @@ pub fn load_icon(path: &str) -> Option<eframe::egui::ColorImage> {
 }
 
 /// Launch counts, so things you open often rank higher.
+#[derive(Clone)]
 pub struct History {
     counts: HashMap<String, u32>,
 }
