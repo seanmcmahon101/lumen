@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 pub struct Update {
     pub version: String,
+    download: Option<String>, // the versioned installer, when the release has one
 }
 
 impl Update {
-    pub fn release_url(&self) -> String {
-        format!("https://github.com/seanmcmahon101/lumen/releases/tag/v{}", self.version)
+    /// Downloads the versioned installer directly, or opens the release page.
+    pub fn url(&self) -> String {
+        self.download.clone().unwrap_or_else(|| format!("https://github.com/seanmcmahon101/lumen/releases/tag/v{}", self.version))
     }
 }
 
@@ -66,12 +68,12 @@ fn version_parts(version: &str) -> Option<(u32, u32, u32)> {
 
 fn newer_release(release: &serde_json::Value, installed: &str) -> Option<Update> {
     let version = release.get("tag_name")?.as_str()?.strip_prefix('v')?;
-    let has_installer = release
-        .get("assets")?
-        .as_array()?
-        .iter()
-        .any(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some("Lumen-Setup-x64.exe"));
-    if has_installer && version_parts(version)? > version_parts(installed)? { Some(Update { version: version.into() }) } else { None }
+    let assets = release.get("assets")?.as_array()?;
+    let named = |name: &str| assets.iter().find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name));
+    let download =
+        named(&format!("Lumen-Setup-{version}-x64.exe")).and_then(|asset| asset.get("browser_download_url")?.as_str()).map(String::from);
+    let has_installer = download.is_some() || named("Lumen-Setup-x64.exe").is_some();
+    if has_installer && version_parts(version)? > version_parts(installed)? { Some(Update { version: version.into(), download }) } else { None }
 }
 
 #[cfg(test)]
@@ -85,6 +87,10 @@ mod tests {
         assert_eq!(newer_release(&release, "0.9.0").unwrap().version, "0.10.0");
         assert!(newer_release(&release, "0.10.0").is_none());
         assert!(newer_release(&release, "0.11.0").is_none());
+        assert!(newer_release(&release, "0.9.0").unwrap().url().ends_with("/releases/tag/v0.10.0"));
+        release["assets"] =
+            json!([{"name": "Lumen-Setup-0.10.0-x64.exe", "browser_download_url": "https://example.test/Lumen-Setup-0.10.0-x64.exe"}]);
+        assert_eq!(newer_release(&release, "0.9.0").unwrap().url(), "https://example.test/Lumen-Setup-0.10.0-x64.exe");
         release["tag_name"] = json!("v1.0.0-rc.1");
         assert!(newer_release(&release, "0.9.0").is_none());
         release["tag_name"] = json!("v1.0.0");

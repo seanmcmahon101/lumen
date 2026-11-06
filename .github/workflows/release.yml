@@ -38,17 +38,35 @@ jobs:
           $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
           $compiler = if ($iscc) { $iscc.Source } else { Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
           & $compiler "/DAppVersion=$version" installer/lumen.iss
+          # Lumen 0.4.2 and earlier only offer updates that include this fixed name.
+          Copy-Item "target/installer/Lumen-Setup-$version-x64.exe" 'target/installer/Lumen-Setup-x64.exe'
+          "SETUP=target/installer/Lumen-Setup-$version-x64.exe" >> $env:GITHUB_ENV
 
-      - name: Check install and uninstall
+      - name: Check install, upgrade over a running Lumen, and uninstall
         run: |
-          $setup = Resolve-Path 'target/installer/Lumen-Setup-x64.exe'
+          $setup = Resolve-Path $env:SETUP
+          $built = Resolve-Path 'target/x86_64-pc-windows-msvc/release/lumen.exe'
           $install = Join-Path $env:LOCALAPPDATA 'Lumen'
           $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Lumen.lnk'
           $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          # Stand in for a running Lumen with a long-lived lumen.exe that locks the installed file.
+          function Start-RunningLumen {
+            Copy-Item "$env:SystemRoot\System32\PING.EXE" "$install\lumen.exe" -Force
+            Start-Process "$install\lumen.exe" -ArgumentList '-n', '600', '127.0.0.1' -WindowStyle Hidden
+            Start-Sleep -Seconds 1
+            if (!(Get-Process lumen -ErrorAction SilentlyContinue)) { throw 'Stand-in lumen.exe did not start' }
+          }
           $process = Start-Process $setup -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
           if ($process.ExitCode -ne 0 -or !(Test-Path "$install\lumen.exe") -or !(Test-Path $shortcut)) {
             throw 'Per-user installation failed'
           }
+          Start-RunningLumen
+          $process = Start-Process $setup -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0 -or (Get-Process lumen -ErrorAction SilentlyContinue) -or
+              (Get-FileHash "$install\lumen.exe").Hash -ne (Get-FileHash $built).Hash) {
+            throw 'Upgrade over a running Lumen failed'
+          }
+          Start-RunningLumen
           $process = Start-Process "$install\unins000.exe" -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
           if ($process.ExitCode -ne 0 -or (Test-Path "$install\lumen.exe") -or (Test-Path $shortcut)) {
             throw 'Per-user uninstall failed'
@@ -57,4 +75,4 @@ jobs:
       - name: Publish installer
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:RELEASE_TAG target/installer/Lumen-Setup-x64.exe --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes
+        run: gh release create $env:RELEASE_TAG $env:SETUP target/installer/Lumen-Setup-x64.exe --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes

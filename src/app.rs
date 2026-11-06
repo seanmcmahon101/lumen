@@ -628,9 +628,9 @@ impl Lumen {
                 let response = ui
                     .with_layout(Layout::right_to_left(Align::Center), |ui| ui.link(RichText::new("Update available").size(14.0)))
                     .inner
-                    .on_hover_text(format!("View Lumen {} on GitHub", release.version));
+                    .on_hover_text(format!("Download Lumen {}", release.version));
                 if response.clicked() {
-                    let url = release.release_url();
+                    let url = release.url();
                     self.hide();
                     win::shell_open(&url, "open", None);
                 }

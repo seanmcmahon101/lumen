@@ -20,11 +20,11 @@ display under the pointer.
 
 Lumen checks GitHub for a newer installer at startup, every six hours, and when
 you open it if the last check was over an hour ago. When
-**Update available** appears, click it to open the release page and download
-the installer.
+**Update available** appears, click it to download the installer for that
+version, for example `Lumen-Setup-0.4.3-x64.exe`.
 
-For an update or uninstall, first search for **Quit Lumen** and press Enter.
-Run the new installer to update, or remove Lumen from **Settings → Apps**.
+Run the new installer to update, or remove Lumen from **Settings → Apps**. Both
+close a running Lumen for you.
 
 ## Search examples
 

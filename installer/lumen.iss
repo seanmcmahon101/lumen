@@ -12,10 +12,9 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 MinVersion=10.0
-AppMutex=Local\Lumen.Launcher
 UninstallDisplayIcon={app}\lumen.exe
 OutputDir=..\target\installer
-OutputBaseFilename=Lumen-Setup-x64
+OutputBaseFilename=Lumen-Setup-{#AppVersion}-x64
 WizardStyle=modern
 
 [Files]
@@ -29,3 +28,25 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\lumen.exe"; Description: "Start Lumen (press Win+Space to search)"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Lumen runs in the background, so stop it rather than asking the user to.
+procedure StopLumen;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM lumen.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(500);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopLumen;
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  StopLumen;
+  Result := True;
+end;
