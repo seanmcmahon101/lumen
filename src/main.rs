@@ -5,6 +5,7 @@ mod calc;
 mod hook;
 mod index;
 mod mail;
+mod tray;
 mod update;
 mod win;
 
@@ -14,13 +15,17 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::w;
 
 fn main() -> eframe::Result {
-    // One instance only.
+    // One instance only. Starting Lumen again opens the one already running.
     unsafe {
         let _ = CreateMutexW(None, true, w!("Local\\Lumen.Launcher"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if !std::env::args().any(|a| a == "--background") {
+                win::signal_running();
+            }
             return Ok(());
         }
     }
+    win::listen_for_relaunch();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

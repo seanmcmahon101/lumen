@@ -85,7 +85,7 @@ pub struct Lumen {
     pending_icons: HashSet<String>,
     seen_focus: bool,
     ghost_shown: bool,
-    startup: bool,
+    show_at_launch: bool,
     profile: String,
     backdrop: Option<TextureHandle>,
     display_overlay: win::DisplayOverlay,
@@ -194,11 +194,15 @@ impl Lumen {
         });
 
         crate::hook::spawn(win::toggle);
+        crate::tray::spawn();
+        win::migrate_startup();
 
         // `lumen --show "query"` opens straight away (handy for testing).
         let args: Vec<String> = std::env::args().collect();
         let mut query = String::new();
         let pinned = args.iter().any(|a| a == "--show");
+        // Started from the Start menu or the installer, not at login: show the search bar.
+        let show_at_launch = !pinned && !args.iter().any(|a| a == "--background");
         let (update_rx, update_opened) = crate::update::watch(ctx.clone());
         if let Some(i) = args.iter().position(|a| a == "--show") {
             query = args.get(i + 1).cloned().unwrap_or_default();
@@ -223,7 +227,7 @@ impl Lumen {
             pending_icons: HashSet::new(),
             seen_focus: false,
             ghost_shown: false,
-            startup: win::startup_enabled(),
+            show_at_launch,
             profile: std::env::var("USERPROFILE").unwrap_or_default(),
             backdrop: None,
             display_overlay: win::DisplayOverlay::default(),
@@ -325,7 +329,7 @@ impl Lumen {
 
         let mut commands = Vec::new();
         if lower.chars().count() >= 3 {
-            let startup_title = if self.startup { "Stop starting Lumen at login" } else { "Start Lumen at login" };
+            let startup_title = if win::startup_enabled() { "Stop starting Lumen at login" } else { "Start Lumen at login" };
             for (title, glyph, action) in [("Quit Lumen", G_POWER, Action::Quit), (startup_title, G_SETTINGS, Action::ToggleStartup)] {
                 if title.to_lowercase().split_whitespace().any(|w| w.starts_with(&lower)) || title.to_lowercase().contains(&lower) {
                     commands.push(simple(title, "Lumen", "Command", glyph, action));
@@ -449,11 +453,8 @@ impl Lumen {
                 win::shell_open(target, "open", None);
             }
             (_, _, Action::Copy(text)) => win::copy(text),
-            (_, _, Action::Quit) => std::process::exit(0),
-            (_, _, Action::ToggleStartup) => {
-                self.startup = !self.startup;
-                win::set_startup(self.startup);
-            }
+            (_, _, Action::Quit) => crate::tray::quit(),
+            (_, _, Action::ToggleStartup) => win::set_startup(!win::startup_enabled()),
         }
         if let Some(k) = item.history_key.clone() {
             self.history.bump(&k);
@@ -733,7 +734,7 @@ impl eframe::App for Lumen {
         if self.frames == 1 {
             ctx.request_repaint();
         } else if self.frames == 2 && !win::VISIBLE.load(Ordering::Relaxed) {
-            win::hide();
+            if self.show_at_launch { win::show() } else { win::hide() }
         }
         if !win::VISIBLE.load(Ordering::Relaxed) {
             self.display_overlay.close();

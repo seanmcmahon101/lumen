@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS,
     DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, GetStockObject, HBRUSH, HDC, HGDIOBJ,
@@ -12,10 +14,13 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, CreateEventW, EVENT_MODIFY_STATE, GetCurrentThreadId, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
     GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, ShowWindowAsync, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
@@ -39,6 +44,37 @@ fn hwnd() -> HWND {
 
 pub fn toggle() {
     if VISIBLE.load(Ordering::Relaxed) { hide() } else { show() }
+}
+
+/// Shows the search bar unless it is already open.
+pub fn open() {
+    if !VISIBLE.load(Ordering::Relaxed) {
+        show();
+    }
+}
+
+const SHOW_EVENT: PCWSTR = w!("Local\\Lumen.Show");
+
+/// Opens the search bar whenever another `lumen.exe` starts, such as from the Start menu.
+pub fn listen_for_relaunch() {
+    let Ok(event) = (unsafe { CreateEventW(None, false, false, SHOW_EVENT) }) else { return };
+    let event = event.0 as isize; // a raw HANDLE cannot cross threads
+    std::thread::spawn(move || {
+        while unsafe { WaitForSingleObject(HANDLE(event as *mut c_void), INFINITE) } == WAIT_OBJECT_0 {
+            open();
+        }
+    });
+}
+
+/// Asks the Lumen already running to open, and lets it take the foreground from us.
+pub fn signal_running() {
+    unsafe {
+        if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
+    }
 }
 
 /// Safe to call from any thread (the hook calls it).
@@ -395,23 +431,55 @@ mod tests {
     }
 }
 
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 
-fn reg(args: &[&str]) -> bool {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg.exe").args(args).creation_flags(0x0800_0000).output().is_ok_and(|o| o.status.success())
+/// The command Windows runs for Lumen at login, if any.
+fn startup_command() -> Option<String> {
+    let mut buffer = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&buffer) as u32;
+    let status = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Lumen"), RRF_RT_REG_SZ, None, Some(buffer.as_mut_ptr().cast()), Some(&mut bytes))
+    };
+    // The size includes the terminating null.
+    (status == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buffer[..(bytes as usize / 2).saturating_sub(1)]))
+}
+
+fn write_startup(command: Option<&str>) {
+    unsafe {
+        match command {
+            Some(command) => {
+                let wide: Vec<u16> = command.encode_utf16().chain([0]).collect();
+                let _ = RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    RUN_KEY,
+                    w!("Lumen"),
+                    REG_SZ.0,
+                    Some(wide.as_ptr().cast()),
+                    std::mem::size_of_val(wide.as_slice()) as u32,
+                );
+            }
+            None => {
+                let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("Lumen"));
+            }
+        }
+    }
 }
 
 pub fn startup_enabled() -> bool {
-    reg(&["query", RUN_KEY, "/v", "Lumen"])
+    startup_command().is_some()
 }
 
+/// At login Lumen starts with `--background`, so it waits for Win+Space.
 pub fn set_startup(on: bool) {
-    if on {
-        let exe = std::env::current_exe().unwrap_or_default();
-        let value = format!("\"{}\"", exe.display());
-        reg(&["add", RUN_KEY, "/v", "Lumen", "/t", "REG_SZ", "/d", &value, "/f"]);
-    } else {
-        reg(&["delete", RUN_KEY, "/v", "Lumen", "/f"]);
+    let exe = std::env::current_exe().unwrap_or_default();
+    write_startup(on.then(|| format!("\"{}\" --background", exe.display())).as_deref());
+}
+
+/// Lumen 0.4 registered for login without `--background`; without it, Lumen now opens the search bar.
+pub fn migrate_startup() {
+    if let Some(command) = startup_command()
+        && !command.contains("--background")
+    {
+        write_startup(Some(&format!("{command} --background")));
     }
 }

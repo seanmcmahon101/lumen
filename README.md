@@ -11,8 +11,12 @@ puts that result first.
 Download [Lumen-Setup-x64.exe](https://github.com/seanmcmahon101/lumen/releases/latest/download/Lumen-Setup-x64.exe)
 and run it on Windows 10 or 11. Setup installs Lumen into your own Windows
 profile and adds a Start menu shortcut. It requires no administrator rights.
-Start Lumen and press **Win+Space** to search. To have it open at login, search
-for **Start Lumen at login** in Lumen and press Enter.
+Start Lumen from the Start menu to open the search bar; after that, press
+**Win+Space**. Starting Lumen again while it runs opens the search bar too.
+Lumen keeps an icon in the notification area: click it to search, or right-click
+it for **Start at login** and **Quit Lumen**. You can also search for
+**Start Lumen at login** in Lumen and press Enter. At login Lumen starts hidden
+and waits for Win+Space.
 
 On multiple monitors, Lumen opens in the centre of the active app's display and
 dims the others until you close it. When the desktop has focus, Lumen uses the
