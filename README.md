@@ -30,6 +30,11 @@ version, for example `Lumen-Setup-0.4.3-x64.exe`.
 Run the new installer to update, or remove Lumen from **Settings → Apps**. Both
 close a running Lumen for you.
 
+Windows code signing is being set up through the SignPath Foundation; current
+downloads are unsigned. See the [Code signing policy](SIGNING.md) and
+[Privacy policy](PRIVACY.md). A trusted signature identifies the publisher,
+but new releases can still show SmartScreen warnings while reputation builds.
+
 ## Search examples
 
 - `excel budget` — spreadsheets only, including common misspellings.
