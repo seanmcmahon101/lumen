@@ -4,6 +4,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($env:GITHUB_ACTIONS -ne 'true') {
+    throw 'Run this install/upgrade/uninstall test only on a disposable GitHub Actions runner'
+}
 $setupPath = (Resolve-Path -LiteralPath $Setup).Path
 $appPath = (Resolve-Path -LiteralPath $App).Path
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($appPath).ProductVersion

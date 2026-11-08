@@ -76,13 +76,13 @@ jobs:
           )
           $arguments | ConvertTo-Json | Set-Content 'target/installer-arguments.json'
           # Inno's supported two-pass process writes an unsigned .e32/.e64 and
-          # exits with code 1. After signing it, the same compile embeds its signature.
+          # exits with code 2. After signing it, the same compile embeds its signature.
           $PSNativeCommandUseErrorActionPreference = $false
           & $compiler @arguments
           $compileExit = $LASTEXITCODE
           $uninstallers = @(Get-ChildItem $uninstallerDir -File | Where-Object Extension -In '.e32', '.e64')
-          if ($compileExit -ne 1 -or $uninstallers.Count -ne 1 -or (Test-Path $setup)) {
-            throw 'Inno Setup did not stop at the expected unsigned-uninstaller preparation step'
+          if ($compileExit -ne 2 -or $uninstallers.Count -ne 1 -or (Test-Path $setup)) {
+            throw "Unexpected uninstaller preparation result: compiler exit $compileExit, $($uninstallers.Count) templates"
           }
           $LASTEXITCODE = 0 # the expected compiler stop must not fail this step
           Copy-Item $env:APP_EXE (Join-Path $payload.FullName 'lumen.exe')
