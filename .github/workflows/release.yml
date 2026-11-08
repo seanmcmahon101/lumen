@@ -58,6 +58,22 @@ jobs:
           path: source
           persist-credentials: false
 
+      - name: Validation only - prepare a temporary runner certificate
+        if: env.VALIDATE_ONLY == 'true'
+        timeout-minutes: 3
+        run: |
+          Write-Host 'Creating a software-only test signing certificate.'
+          $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Lumen CI test only - not for distribution' -CertStoreLocation Cert:\CurrentUser\My -KeyProtection None -Provider 'Microsoft Software Key Storage Provider'
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'lumen-ci-test.cer'
+          Export-Certificate -Cert $certificate -FilePath $certificateFile | Out-Null
+          # CurrentUser\Root may display a confirmation dialog. This disposable
+          # hosted runner is elevated, so use its machine stores without a UI.
+          Write-Host 'Trusting the test certificate on this disposable runner only.'
+          Import-Certificate -FilePath $certificateFile -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Import-Certificate -FilePath $certificateFile -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          "CI_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+          Write-Host 'Test certificate is ready.'
+
       - name: Test and build with Windows product metadata
         run: ../scripts/build-windows-release.ps1 -Tag $env:RELEASE_TAG
 
@@ -118,18 +134,15 @@ jobs:
 
       - name: Validation only - sign payload with an isolated runner certificate
         if: env.VALIDATE_ONLY == 'true'
+        timeout-minutes: 3
         run: |
-          $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Lumen CI test only - not for distribution' -CertStoreLocation Cert:/CurrentUser/My
-          $public = Export-Certificate -Cert $certificate -FilePath 'target/ci-test.cer'
-          Import-Certificate -FilePath $public.FullName -CertStoreLocation Cert:/CurrentUser/Root | Out-Null
-          Import-Certificate -FilePath $public.FullName -CertStoreLocation Cert:/CurrentUser/TrustedPublisher | Out-Null
           $signed = New-Item -ItemType Directory -Force 'target/signing/signed-payload'
           Copy-Item 'target/signing/payload/*' $signed.FullName -Recurse
           $PSNativeCommandUseErrorActionPreference = $true
           Get-ChildItem $signed -Recurse -File | ForEach-Object {
-            & "$env:WINDOWS_SDK_BIN/signtool.exe" sign /sha1 $certificate.Thumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            Write-Host "Signing test payload $($_.Name)."
+            & "$env:WINDOWS_SDK_BIN/signtool.exe" sign /sha1 $env:CI_CERTIFICATE_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
           }
-          "CI_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
 
       - name: Verify signed payload and build installer
         run: |
@@ -171,6 +184,7 @@ jobs:
 
       - name: Validation only - sign installer with the runner certificate
         if: env.VALIDATE_ONLY == 'true'
+        timeout-minutes: 3
         run: |
           $signed = New-Item -ItemType Directory -Force 'target/installer/signed'
           Copy-Item $env:SETUP $signed.FullName
