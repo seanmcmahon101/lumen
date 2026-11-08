@@ -6,113 +6,221 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to package (for example v0.2.0)
+        description: Existing version tag to build or replace with signed installers
         required: true
+        type: string
+      validate_only:
+        description: Test packaging with a temporary CI certificate; never publish a release
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  actions: read # lets SignPath read the uploaded artifact while signing
+  actions: read # lets SignPath read uploaded artifacts
+
+concurrency:
+  group: windows-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 90 # allows time to approve both requests in SignPath
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
     env:
       RUSTFLAGS: '-C target-feature=+crt-static'
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      # Signing activates automatically once SIGNPATH_API_TOKEN and
-      # SIGNPATH_ORGANIZATION_ID are added as repository secrets.
-      HAS_SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+      VALIDATE_ONLY: ${{ inputs.validate_only == true }}
+      HAS_SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' && secrets.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require signing credentials before building a public release
+        working-directory: ${{ github.workspace }}
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Expected a stable version tag such as v0.5.1' }
+          if ($env:VALIDATE_ONLY -ne 'true' -and $env:HAS_SIGNPATH -ne 'true') {
+            throw 'Signing is required. Configure SIGNPATH_API_TOKEN and SIGNPATH_ORGANIZATION_ID; see SIGNING.md. No release was changed.'
+          }
+
+      # Keep current packaging tools separate from the tagged application source.
+      # This lets workflow_dispatch sign old releases without moving their tags.
+      - name: Check out release tooling
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out the application version
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: source
+          persist-credentials: false
 
-      - name: Test and build
+      - name: Test and build with Windows product metadata
+        run: ../scripts/build-windows-release.ps1 -Tag $env:RELEASE_TAG
+
+      - name: Prepare app and uninstaller for signing
         run: |
+          $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          $compiler = if ($compiler) { $compiler.Source } else { Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe' }
+          $payload = New-Item -ItemType Directory -Force 'target/signing/payload'
+          $uninstallerDir = New-Item -ItemType Directory -Force 'target/signing/payload/uninstaller'
+          $output = New-Item -ItemType Directory -Force 'target/installer'
+          $setup = Join-Path $output.FullName "Lumen-Setup-$env:APP_VERSION-x64.exe"
+          $arguments = @(
+            "/DAppVersion=$env:APP_VERSION", "/DAppBinary=$env:APP_EXE",
+            "/DBuildOutputDir=$($output.FullName)", "/DUninstallerDirectory=$($uninstallerDir.FullName)",
+            '/DSignedBuild=1', (Resolve-Path '../installer/lumen.iss').Path
+          )
+          $arguments | ConvertTo-Json | Set-Content 'target/installer-arguments.json'
+          # Inno's supported two-pass process writes an unsigned .e32/.e64 and
+          # exits with code 1. After signing it, the same compile embeds its signature.
+          $PSNativeCommandUseErrorActionPreference = $false
+          & $compiler @arguments
+          $compileExit = $LASTEXITCODE
+          $uninstallers = @(Get-ChildItem $uninstallerDir -File | Where-Object Extension -In '.e32', '.e64')
+          if ($compileExit -ne 1 -or $uninstallers.Count -ne 1 -or (Test-Path $setup)) {
+            throw 'Inno Setup did not stop at the expected unsigned-uninstaller preparation step'
+          }
+          $LASTEXITCODE = 0 # the expected compiler stop must not fail this step
+          Copy-Item $env:APP_EXE (Join-Path $payload.FullName 'lumen.exe')
+          "ISCC=$compiler" >> $env:GITHUB_ENV
+          "UNINSTALLER_NAME=$($uninstallers[0].Name)" >> $env:GITHUB_ENV
+          "SETUP=$setup" >> $env:GITHUB_ENV
+
+      - name: Upload app and uninstaller for signing
+        if: env.VALIDATE_ONLY != 'true'
+        id: unsigned-payload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: lumen-payload-unsigned
+          path: source/target/signing/payload/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Sign app and uninstaller with SignPath
+        if: env.VALIDATE_ONLY != 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: lumen
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: payload
+          github-artifact-id: ${{ steps.unsigned-payload.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: ${{ github.workspace }}/source/target/signing/signed-payload
+          parameters: |
+            version: "${{ env.APP_VERSION }}.0"
+
+      - name: Validation only - sign payload with an isolated runner certificate
+        if: env.VALIDATE_ONLY == 'true'
+        run: |
+          $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Lumen CI test only - not for distribution' -CertStoreLocation Cert:/CurrentUser/My
+          $public = Export-Certificate -Cert $certificate -FilePath 'target/ci-test.cer'
+          Import-Certificate -FilePath $public.FullName -CertStoreLocation Cert:/CurrentUser/Root | Out-Null
+          Import-Certificate -FilePath $public.FullName -CertStoreLocation Cert:/CurrentUser/TrustedPublisher | Out-Null
+          $signed = New-Item -ItemType Directory -Force 'target/signing/signed-payload'
+          Copy-Item 'target/signing/payload/*' $signed.FullName -Recurse
           $PSNativeCommandUseErrorActionPreference = $true
-          rustup update stable --no-self-update
-          cargo +stable test --locked --release --target x86_64-pc-windows-msvc
-          cargo +stable build --locked --release --target x86_64-pc-windows-msvc
+          Get-ChildItem $signed -Recurse -File | ForEach-Object {
+            & "$env:WINDOWS_SDK_BIN/signtool.exe" sign /sha1 $certificate.Thumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+          }
+          "CI_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
 
-      - name: Build installer
+      - name: Verify signed payload and build installer
         run: |
-          $version = (cargo +stable metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($env:RELEASE_TAG -cne "v$version") { throw 'Release tag must match Cargo.toml' }
-          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-          $compiler = if ($iscc) { $iscc.Source } else { Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe' }
-          & $compiler "/DAppVersion=$version" installer/lumen.iss
-          # Lumen 0.4.2 and earlier only offer updates that include this fixed name.
-          Copy-Item "target/installer/Lumen-Setup-$version-x64.exe" 'target/installer/Lumen-Setup-x64.exe'
-          "SETUP=target/installer/Lumen-Setup-$version-x64.exe" >> $env:GITHUB_ENV
+          $app = 'target/signing/signed-payload/lumen.exe'
+          $uninstaller = "target/signing/signed-payload/uninstaller/$env:UNINSTALLER_NAME"
+          ../scripts/verify-windows-signature.ps1 -Path $app, $uninstaller -ProductVersion "$env:APP_VERSION.0"
+          Copy-Item $app $env:APP_EXE -Force
+          Copy-Item $uninstaller 'target/signing/payload/uninstaller/' -Force
+          $arguments = @(Get-Content 'target/installer-arguments.json' -Raw | ConvertFrom-Json)
+          $PSNativeCommandUseErrorActionPreference = $true
+          & $env:ISCC @arguments
+          if (!(Test-Path $env:SETUP)) { throw 'Installer was not produced' }
 
-      - name: Check install, upgrade over a running Lumen, and uninstall
-        run: |
-          $setup = Resolve-Path $env:SETUP
-          $built = Resolve-Path 'target/x86_64-pc-windows-msvc/release/lumen.exe'
-          $install = Join-Path $env:LOCALAPPDATA 'Lumen'
-          $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Lumen.lnk'
-          $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
-          # Stand in for a running Lumen with a long-lived lumen.exe that locks the installed file.
-          function Start-RunningLumen {
-            Copy-Item "$env:SystemRoot\System32\PING.EXE" "$install\lumen.exe" -Force
-            Start-Process "$install\lumen.exe" -ArgumentList '-n', '600', '127.0.0.1' -WindowStyle Hidden
-            Start-Sleep -Seconds 1
-            if (!(Get-Process lumen -ErrorAction SilentlyContinue)) { throw 'Stand-in lumen.exe did not start' }
-          }
-          $process = Start-Process $setup -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0 -or !(Test-Path "$install\lumen.exe") -or !(Test-Path $shortcut)) {
-            throw 'Per-user installation failed'
-          }
-          Start-RunningLumen
-          $process = Start-Process $setup -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0 -or (Get-Process lumen -ErrorAction SilentlyContinue) -or
-              (Get-FileHash "$install\lumen.exe").Hash -ne (Get-FileHash $built).Hash) {
-            throw 'Upgrade over a running Lumen failed'
-          }
-          Start-RunningLumen
-          $process = Start-Process "$install\unins000.exe" -ArgumentList $setupArgs -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0 -or (Test-Path "$install\lumen.exe") -or (Test-Path $shortcut)) {
-            throw 'Per-user uninstall failed'
-          }
-
-      # SignPath Foundation signs the installer on their HSM free of charge for
-      # OSS. Portal setup must match these slugs: project "lumen", signing
-      # policy "release-signing", and an artifact configuration whose root is
-      # <zip-file> (upload-artifact zips the file) containing one .exe entry.
       - name: Upload installer for signing
-        id: upload-unsigned-artifact
-        if: env.HAS_SIGNPATH == 'true'
-        uses: actions/upload-artifact@v7
+        if: env.VALIDATE_ONLY != 'true'
+        id: unsigned-installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: lumen-installer-unsigned
           path: ${{ env.SETUP }}
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Submit signing request to SignPath
-        if: env.HAS_SIGNPATH == 'true'
-        uses: signpath/github-action-submit-signing-request@v3
+      - name: Sign installer with SignPath
+        if: env.VALIDATE_ONLY != 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
         with:
-          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
-          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
-          project-slug: 'lumen'
-          signing-policy-slug: 'release-signing'
-          github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
-          output-artifact-directory: ${{ github.workspace }}/target/installer/signed
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: lumen
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: ${{ github.workspace }}/source/target/installer/signed
+          parameters: |
+            version: "${{ env.APP_VERSION }}.0"
 
-      - name: Publish installer
+      - name: Validation only - sign installer with the runner certificate
+        if: env.VALIDATE_ONLY == 'true'
+        run: |
+          $signed = New-Item -ItemType Directory -Force 'target/installer/signed'
+          Copy-Item $env:SETUP $signed.FullName
+          $setup = Join-Path $signed.FullName (Split-Path $env:SETUP -Leaf)
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "$env:WINDOWS_SDK_BIN/signtool.exe" sign /sha1 $env:CI_CERTIFICATE_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $setup
+
+      - name: Verify final downloads and check install, upgrade, and uninstall
+        run: |
+          $setup = Join-Path 'target/installer/signed' (Split-Path $env:SETUP -Leaf)
+          $publisher = (Get-AuthenticodeSignature -LiteralPath $env:APP_EXE).SignerCertificate.Thumbprint
+          ../scripts/verify-windows-signature.ps1 -Path $setup -ProductVersion "$env:APP_VERSION.0" -PublisherThumbprint $publisher
+          # The fixed-name asset also serves updates offered by Lumen 0.4.2 and earlier.
+          Copy-Item $setup 'target/installer/signed/Lumen-Setup-x64.exe' -Force
+          ../scripts/test-windows-installer.ps1 -Setup $setup -App $env:APP_EXE
+          Get-ChildItem 'target/installer/signed/*.exe' | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content 'target/installer/signed/SHA256SUMS.txt' -Encoding utf8
+
+      - name: Publish signed installers or replace an existing release's downloads
+        if: env.VALIDATE_ONLY != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $versioned = Resolve-Path $env:SETUP
-          # SignPath (upstream step) extracts the signed installer here.
-          $signed = Join-Path 'target/installer/signed' (Split-Path $versioned -Leaf)
-          $setup = if (Test-Path $signed) {
-            Write-Host 'Publishing the SignPath-signed installer.'
-            (Resolve-Path $signed).Path
+          $files = @(Get-ChildItem 'target/installer/signed/*.exe' | ForEach-Object FullName)
+          # Recheck the exact files being uploaded. There is no unsigned fallback.
+          $publisher = (Get-AuthenticodeSignature -LiteralPath $env:APP_EXE).SignerCertificate.Thumbprint
+          ../scripts/verify-windows-signature.ps1 -Path $files -ProductVersion "$env:APP_VERSION.0" -PublisherThumbprint $publisher
+          $files += (Resolve-Path 'target/installer/signed/SHA256SUMS.txt').Path
+          $policy = "Code signing policy: https://github.com/$env:GITHUB_REPOSITORY/blob/main/SIGNING.md"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $body = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json body --jq .body
+          $exists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($exists) {
+            gh release upload $env:RELEASE_TAG @files --repo $env:GITHUB_REPOSITORY --clobber
+            if (($body -join "`n") -notmatch 'Code signing policy:') {
+              (($body -join "`n") + "`n`n$policy`n") | Set-Content 'target/release-notes.md' -Encoding utf8
+              gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --notes-file 'target/release-notes.md'
+            }
           } else {
-            Write-Host 'No SignPath secrets configured; publishing unsigned installer.'
-            $versioned.Path
+            $policy | Set-Content 'target/release-notes.md' -Encoding utf8
+            gh release create $env:RELEASE_TAG @files --repo $env:GITHUB_REPOSITORY --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes --notes-file 'target/release-notes.md'
           }
-          # The fixed-name asset serves updates offered by Lumen 0.4.2 and earlier.
-          Copy-Item $setup 'target/installer/Lumen-Setup-x64.exe' -Force
-          gh release create $env:RELEASE_TAG $setup 'target/installer/Lumen-Setup-x64.exe' --verify-tag --title "Lumen $env:RELEASE_TAG" --generate-notes
+
+      - name: Keep validation results separate from public releases
+        if: env.VALIDATE_ONLY == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: validation-only-not-for-distribution
+          path: source/target/installer/signed/
+          if-no-files-found: error
+          retention-days: 3

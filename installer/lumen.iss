@@ -1,11 +1,21 @@
 #ifndef AppVersion
   #error Pass AppVersion to ISCC with /DAppVersion=<version>.
 #endif
+#ifndef AppBinary
+  #define AppBinary "..\target\x86_64-pc-windows-msvc\release\lumen.exe"
+#endif
+#ifndef BuildOutputDir
+  #define BuildOutputDir "..\target\installer"
+#endif
 
 [Setup]
 AppId=Lumen.Launcher
 AppName=Lumen
 AppVersion={#AppVersion}
+AppPublisher=Sean McMahon
+VersionInfoProductName=Lumen
+VersionInfoProductVersion={#AppVersion}.0
+VersionInfoProductTextVersion={#AppVersion}.0
 DefaultDirName={localappdata}\Lumen
 DisableDirPage=yes
 DisableProgramGroupPage=yes
@@ -13,12 +23,16 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 MinVersion=10.0
 UninstallDisplayIcon={app}\lumen.exe
-OutputDir=..\target\installer
+OutputDir={#BuildOutputDir}
 OutputBaseFilename=Lumen-Setup-{#AppVersion}-x64
 WizardStyle=modern
+#ifdef SignedBuild
+SignedUninstaller=yes
+SignedUninstallerDir={#UninstallerDirectory}
+#endif
 
 [Files]
-Source: "..\target\x86_64-pc-windows-msvc\release\lumen.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#AppBinary}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\Lumen"; Filename: "{app}\lumen.exe"; Comment: "Start Lumen, then press Win+Space to search"
