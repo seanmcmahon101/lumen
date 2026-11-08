@@ -25,8 +25,11 @@ foreach ($file in $Path) {
             throw "Unexpected signing certificate on $file"
         }
         $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($check)
-        if ($info.ProductName -cne 'Lumen' -or $info.ProductVersion -cne $ProductVersion) {
-            throw "Unexpected product metadata on $file"
+        # Inno reserves fixed-width string resources and pads them with spaces.
+        $name = ([string]$info.ProductName).Trim()
+        $version = ([string]$info.ProductVersion).Trim()
+        if ($name -cne 'Lumen' -or $version -cne $ProductVersion) {
+            throw "Unexpected product metadata on $file (name '$name', version '$version')"
         }
         Write-Host "Verified $file - $($signature.SignerCertificate.Subject)"
     } finally {
