@@ -6,6 +6,80 @@ Tab completes, and Escape closes. Click the search filters to switch scope.
 Lumen remembers what you open for each search, so typing the same letters again
 puts that result first.
 
+Type **/** to browse commands, or **/help** (also **F1**) for searchable help,
+examples and keyboard shortcuts. Enter chooses a command; Tab completes it.
+Escape returns from a command to your previous search, then closes Lumen.
+
+## Commands and shortcuts
+
+| Command | Use |
+| --- | --- |
+| `/help [topic]` | Find commands and examples, such as `/help excel` or `/help keyboard`. |
+| `/pins [filter]` | Open pinned apps, files and folders. Pins also appear before typing. |
+| `/pin`, `/unpin` | Pin or unpin the result selected before you started the command. `/pin C:\Work` also accepts a full path. **Ctrl+D** toggles a result's pin. |
+| `/recent [filter]` | Items opened through Lumen, newest first. Up to 30 are retained; five unpinned recents appear on the empty search bar. |
+| `/alias name [path or URL]` | Give the selected item an explicit shortcut. Select your invoices folder, type `/alias inv`, and press Enter. Typing `inv` in ordinary search then puts it first. A full path or URL can also be supplied. |
+| `/aliases`, `/unalias name` | Browse shortcuts or remove one. Removing a shortcut leaves the original item in place. |
+| `/windows [title]` | Find an open desktop window by title and switch to it, including minimized windows. The list refreshes when Lumen opens. |
+| `/actions [search]` | Actions for the selected result, or the first match for a supplied search. **Ctrl+K** opens the same list. Open, reveal, copy path, run as administrator, pin, create an alias, preview, and open a terminal appear when applicable. |
+| `/preview [search]` | Preview a selected spreadsheet, or find one with `/preview excel budget`. **Ctrl+P** previews the selected result. Shows up to eight excerpts with real worksheet and cell references; Enter on an excerpt copies its text. |
+| `/calc expression` | Calculate and copy the answer, for example `/calc 125 * 1.2`. Ordinary arithmetic also works without a command. |
+| `/convert value unit in unit` | Offline conversion, for example `/convert 10 miles in km`, `/convert 2 GiB in MiB`, or `/convert 32 F in C`. Also works without the command. |
+| `/date [calculation]` | Today's local date, `today + 30 days`, `today + 2 weeks`, or `2026-12-25 - today`. Use `YYYY-MM-DD` for dates; Enter copies the answer. Date calculations also work in ordinary search. |
+| `/settings` | Change the opening shortcut, search sources, profile coverage, additional folders and exclusions. Save applies changes and refreshes search in the background. |
+| `/reindex`, `/status` | Refresh the index or inspect its progress, approximate size, folders and enabled sources. |
+| `/perf` | View recent and p95 opening, local search and result-display timings, working-set memory, and CPU since the previous `/perf` snapshot. Leave Lumen idle between snapshots to inspect idle CPU. |
+
+Explicit aliases take priority over learned ranking. Pins (up to 64), aliases
+(up to 128), recents and preferences are saved locally; writes run off the UI
+thread. Available opening shortcuts are Win+Space, Alt+Space, Ctrl+Space and
+Ctrl+Alt+Space. The default is Win+Space.
+
+Conversions cover length (`m`, `km`, `cm`, `mm`, `mi`, `ft`, `in`, `yd`), area
+(`m2`, `km2`, `ft2`, `acre`, `ha`), mass (`kg`, `g`, `mg`, `lb`, `oz`, `st`),
+volume (`l`, `ml`, `ukgal`, `usgal`), time (`ms`, `s`, `min`, `h`, `d`, `weeks`),
+data and temperature (`C`, `F`, `K`). Data units use bytes: KB/MB/GB are decimal;
+KiB/MiB/GiB are binary. Currency conversion requires live rates and is not included.
+
+Previews are read only when requested, on a background worker. They share the
+16 MB source-file and cloud-placeholder exclusions of content indexing, skip
+network files, and inspect at most 32 worksheets / 100,000 cells with a two-second
+cell-scan budget. The preview opens the workbook rather than navigating to a cell.
+
+## Startup and performance
+
+A versioned index snapshot is saved under `%LOCALAPPDATA%\Lumen`. At startup,
+Lumen loads it in the background and makes it searchable while reconciling current
+files. A missing, corrupt, incompatible or differently configured snapshot falls
+back to a fresh scan. Cached results may briefly include files changed while Lumen
+was closed. Unchanged workbook text is reused. Network drives refresh separately.
+
+Outlook searches use an isolated **native COM helper**, querying the existing
+Windows Search index and attaching to running classic Outlook as a bounded
+fallback. Searching does not start PowerShell. A cancelled or timed-out helper is
+terminated without blocking the launcher; the seven-second deadline still applies.
+
+`/perf` retains at most 128 samples per timing. Opening measures the request to the
+end of the next UI draw; result display measures query dispatch to a draw with its
+results ready. These are application timings, not physical display latency. CPU is
+reported as a percentage of one core over the interval between `/perf` snapshots.
+There is no diagnostic polling while idle. Performance targets should be checked
+on the intended Windows hardware; earlier search figures below are prior measurements.
+
+On 8 November 2026, a release benchmark over 103,148 items and 32 MB of content
+returned all results in about 1.7–3.6 ms for the tested multi-letter queries; a
+broad `b` query took 23.6 ms. A 69.6 MB snapshot decoded in memory in 103 ms,
+compared with a 3.42-second fresh file walk plus 322 ms of content extraction.
+Snapshot decode excludes disk I/O and these figures are specific to this PC.
+
+All matching indexed applications, files and spreadsheets are available in a
+scrollable list. Use the mouse wheel, a trackpad or the scrollbar to browse;
+the search bar and shortcuts stay in place. Up/Down moves the selection,
+Page Up/Page Down moves a page, and Ctrl+Home/Ctrl+End jumps to the first/last
+result. The list follows keyboard selection and starts at the top for a new
+search. A counter shows the visible range and total results. Up to eight rows
+are visible at once, fewer on a short display; only visible rows are drawn.
+
 ## Install on Windows
 
 Download [Lumen-Setup-x64.exe](https://github.com/seanmcmahon101/lumen/releases/latest/download/Lumen-Setup-x64.exe)
@@ -47,7 +121,7 @@ but new releases can still show SmartScreen warnings while reputation builds.
   Restart, Shut down and Sign out ask for a second Enter first.
 
 Settings and commands named exactly appear above files; partial names such as
-`blue` only fill rows that files leave empty.
+`blue` appear after matching files.
 
 Source code and scripts (`.c`, `.go`, `.py`, `.bat`, `.ps1`…) rank below documents.
 They still appear when nothing better matches, or when typed by exact name.
@@ -98,10 +172,12 @@ searchable; encoded MIME bodies/attachments are not decoded. MSG is filename-onl
 ## Outlook
 
 1. Query the existing **Windows Search** mail index (subjects, senders and indexed
-   body text). Lumen does not create a second mailbox index or store credentials.
+   body text), returning up to 1,000 matches, newest first, in the scrollable list.
+   At that limit, Lumen asks you to narrow the search. Lumen does not create a
+   second mailbox index or store credentials.
 2. If that returns no results or fails, attach to an already-running **classic
    Outlook** through COM. Search up to 150 recent messages per Inbox/Sent folder
-   across stores, with a two-second scan budget and six-result limit. This is a
+   across stores, with a two-second scan budget. This is a
    deliberately limited fallback, not a full-mailbox search.
 3. **Search Outlook online** opens the query in Microsoft 365 in your browser.
 
@@ -121,6 +197,12 @@ cargo test
 cargo build --release
 .\target\release\lumen.exe --show "excel budget"
 ```
+
+For a separate development preview alongside an installed copy, use
+`lumen.exe --isolated --show "/help"`. This mode skips the global hotkey,
+notification-area icon, single-instance signalling and startup migration.
+Set `LUMEN_DATA_DIR` to a test folder to keep preferences, shortcuts and the cache
+separate from your normal Lumen data.
 
 Tests cover ranking, filters, spelling tolerance, folder/content matching,
 workbook extraction, mail scope parsing and calculator behavior.

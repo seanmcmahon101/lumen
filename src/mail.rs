@@ -4,6 +4,9 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Keep the Outlook subprocess bounded independently of the visible list height.
+pub const MAX_RESULTS: usize = 1000;
+
 pub fn query(q: &str) -> Option<&str> {
     let q = q.trim();
     let end = q.find(char::is_whitespace).unwrap_or(q.len());
@@ -17,67 +20,10 @@ pub fn search(term: &str, cancelled: impl Fn() -> bool) -> Result<Vec<Entry>, ()
     if cancelled() {
         return Err(());
     }
-    // Pass data through the environment, never interpolate it into executable PowerShell.
-    let script = r#"
-$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=[Text.Encoding]::UTF8
-$items=@()
-$indexed=$false
-$c=$null
-try {
-  $c=New-Object -ComObject ADODB.Connection
-  $c.ConnectionTimeout=3
-  $c.CommandTimeout=4
-  $c.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
-  $where="System.Kind = 'email' AND System.ItemUrl LIKE 'mapi:%'"
-  $words=@($env:LUMEN_MAIL_QUERY -split '\s+' | Where-Object { $_ })
-  foreach($word in $words) {
-    $word=$word.Replace("'","''").Replace('"','')
-    $where += " AND CONTAINS(*, '" + '"' + $word + '*"' + "')"
-  }
-  $rs=$c.Execute("SELECT TOP 6 System.Subject, System.ItemUrl, System.Message.FromName FROM SystemIndex WHERE " + $where + " ORDER BY System.Message.DateReceived DESC")
-  $items=@()
-  while(!$rs.EOF) {
-    $items += @{name=[string]$rs.Fields.Item(0).Value;url=[string]$rs.Fields.Item(1).Value;sender=[string]$rs.Fields.Item(2).Value}
-    $rs.MoveNext()
-  }
-  $indexed=$true
-} catch {} finally { if($null -ne $c -and $c.State -eq 1) { $c.Close() } }
-if($items.Count -eq 0) {
-  try {
-    # Attach only: never start Outlook or prompt to configure a profile.
-    $outlook=[Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
-    $ns=$outlook.GetNamespace('MAPI')
-    $timer=[Diagnostics.Stopwatch]::StartNew()
-    $words=@($env:LUMEN_MAIL_QUERY.ToLowerInvariant() -split '\s+' | Where-Object { $_ })
-    $seen=New-Object 'Collections.Generic.HashSet[string]'
-    foreach($store in $ns.Stores) {
-      foreach($folderId in @(6,5)) {
-        if($timer.Elapsed.TotalSeconds -gt 2 -or $items.Count -ge 6) { break }
-        try { $folder=$store.GetDefaultFolder($folderId); $messages=$folder.Items; $messages.Sort('[ReceivedTime]',$true) } catch { continue }
-        for($i=1; $i -le [Math]::Min($messages.Count,150); $i++) {
-          if($timer.Elapsed.TotalSeconds -gt 2 -or $items.Count -ge 6) { break }
-          $msg=$messages.Item($i)
-          if($msg.Class -ne 43) { continue }
-          $text=([string]$msg.Subject+' '+[string]$msg.SenderName+' '+[string]$msg.Body).ToLowerInvariant()
-          $match=$true
-          foreach($word in $words) { if(!$text.Contains($word)) { $match=$false; break } }
-          if($match -and $seen.Add($msg.EntryID)) {
-            $items += @{name=[string]$msg.Subject;url=('lumen-outlook:'+$store.StoreID+'/'+$msg.EntryID);sender=([string]$msg.SenderName+' · recent mail (COM)')}
-          }
-          [void][Runtime.InteropServices.Marshal]::ReleaseComObject($msg)
-        }
-      }
-      if($timer.Elapsed.TotalSeconds -gt 2 -or $items.Count -ge 6) { break }
-    }
-    $indexed=$true
-  } catch {}
-}
-if(!$indexed) { exit 1 }
-ConvertTo-Json -InputObject $items -Compress
-"#;
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    // The native helper has no GUI startup, shell parser, or PowerShell runtime.
+    // Isolation preserves cancellation and a hard deadline even if a COM provider hangs.
+    let mut child = Command::new(std::env::current_exe().map_err(|_| ())?)
+        .arg("--mail-query")
         .env("LUMEN_MAIL_QUERY", term)
         .creation_flags(0x0800_0000)
         .stdout(Stdio::piped())
@@ -89,7 +35,7 @@ ConvertTo-Json -InputObject $items -Compress
     let reader = std::thread::spawn(move || {
         use std::io::Read;
         let mut bytes = Vec::new();
-        let _ = stdout.take(1024 * 1024).read_to_end(&mut bytes);
+        let _ = stdout.take(16 * 1024 * 1024).read_to_end(&mut bytes);
         bytes
     });
     let start = Instant::now();
@@ -138,16 +84,102 @@ mod tests {
     }
 }
 
-/// Open a classic Outlook COM result without blocking the launcher.
+#[derive(serde::Serialize)]
+struct Row { name: String, url: String, sender: String }
+
+fn sql(term: &str) -> String {
+    let mut sql = format!("SELECT TOP {} System.Subject, System.ItemUrl, System.Message.FromName FROM SystemIndex WHERE System.Kind = 'email' AND System.ItemUrl LIKE 'mapi:%'", MAX_RESULTS);
+    for word in term.split_whitespace().take(32) {
+        let word = word.replace('\'', "''").replace('"', "");
+        sql.push_str(&format!(" AND CONTAINS(*, '\"{word}*\"')"));
+    }
+    sql.push_str(" ORDER BY System.Message.DateReceived DESC"); sql
+}
+
+fn indexed(term: &str) -> windows::core::Result<Vec<Row>> {
+    use crate::automation::{Object, text};
+    let connection = Object::create("ADODB.Connection")?;
+    connection.put("ConnectionTimeout", 3i32.into())?;
+    connection.put("CommandTimeout", 4i32.into())?;
+    connection.call("Open", &["Provider=Search.CollatorDSO;Extended Properties='Application=Windows';".into()])?;
+    let result = (|| {
+        let recordset = connection.called("Execute", &[sql(term).as_str().into()])?;
+        let mut rows = Vec::new();
+        while !bool::try_from(&recordset.get("EOF")?)? && rows.len() < MAX_RESULTS {
+            let fields = recordset.object("Fields", &[])?;
+            let field = |i: i32| -> windows::core::Result<String> { Ok(text(&fields.object("Item", &[i.into()])?.get("Value")?)) };
+            rows.push(Row { name: field(0)?, url: field(1)?, sender: field(2)? });
+            recordset.call("MoveNext", &[])?;
+        }
+        let _ = recordset.call("Close", &[]); Ok(rows)
+    })();
+    let _ = connection.call("Close", &[]); result
+}
+
+fn recent(term: &str) -> windows::core::Result<Vec<Row>> {
+    use crate::automation::Object;
+    let outlook = Object::active("Outlook.Application")?; // Attach only; never launch or configure Outlook.
+    let ns = outlook.called("GetNamespace", &["MAPI".into()])?;
+    let stores = ns.object("Stores", &[])?;
+    let start = Instant::now(); let mut rows = Vec::new(); let mut seen = std::collections::HashSet::new();
+    let words: Vec<_> = term.to_lowercase().split_whitespace().map(str::to_string).collect();
+    'stores: for s in 1..=stores.number("Count").min(64) {
+        let Ok(store) = stores.called("Item", &[s.into()]) else { continue };
+        let store_id = store.text("StoreID");
+        for id in [6i32, 5] {
+            let Ok(folder) = store.called("GetDefaultFolder", &[id.into()]) else { continue };
+            let Ok(messages) = folder.object("Items", &[]) else { continue };
+            let _ = messages.call("Sort", &["[ReceivedTime]".into(), true.into()]);
+            for i in 1..=messages.number("Count").min(150) {
+                if start.elapsed() > Duration::from_secs(2) || rows.len() >= MAX_RESULTS { break 'stores; }
+                let Ok(message) = messages.called("Item", &[i.into()]) else { continue };
+                if message.number("Class") != 43 { continue; }
+                let name = message.text("Subject"); let sender = message.text("SenderName");
+                let text = format!("{name} {sender} {}", message.text("Body")).to_lowercase();
+                let entry = message.text("EntryID");
+                if words.iter().all(|w| text.contains(w)) && !entry.is_empty() && seen.insert(entry.clone()) {
+                    rows.push(Row { name, url: format!("lumen-outlook:{store_id}/{entry}"), sender: format!("{sender} · recent mail (COM)") });
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub fn worker() {
+    let result = (|| {
+        let _com = crate::automation::Apartment::new().map_err(|_| ())?;
+        let term = std::env::var("LUMEN_MAIL_QUERY").unwrap_or_default();
+        if term.len() > 4096 { return Err(()); }
+        let indexed = indexed(&term);
+        match indexed {
+            Ok(rows) if !rows.is_empty() => Ok(rows),
+            Ok(rows) => Ok(recent(&term).unwrap_or(rows)),
+            Err(_) => recent(&term).map_err(|_| ()),
+        }
+    })();
+    match result {
+        Ok(rows) => { let _ = serde_json::to_writer(std::io::stdout().lock(), &rows); }
+        Err(()) => std::process::exit(1),
+    }
+}
+
+/// Display an existing Outlook item on a separate COM apartment.
 pub fn open(target: &str) {
-    let Some((store, entry)) = target.strip_prefix("lumen-outlook:").and_then(|s| s.split_once('/')) else {
-        return;
-    };
+    let Some((store, entry)) = target.strip_prefix("lumen-outlook:").and_then(|s| s.split_once('/')) else { return; };
     let (store, entry) = (store.to_string(), entry.to_string());
     std::thread::spawn(move || {
-        let _ = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "$o=[Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application'); $o.GetNamespace('MAPI').GetItemFromID($env:LUMEN_ENTRY,$env:LUMEN_STORE).Display()"])
-            .env("LUMEN_ENTRY", entry).env("LUMEN_STORE", store)
-            .creation_flags(0x0800_0000).status();
+        let Ok(_com) = crate::automation::Apartment::new() else { return };
+        let Ok(outlook) = crate::automation::Object::active("Outlook.Application") else { return };
+        let Ok(ns) = outlook.called("GetNamespace", &["MAPI".into()]) else { return };
+        if let Ok(item) = ns.called("GetItemFromID", &[entry.as_str().into(), store.as_str().into()]) { let _ = item.call("Display", &[]); }
     });
+}
+
+#[cfg(test)] mod native_tests {
+    use super::*;
+    #[test] fn indexed_query_quotes_user_text_and_retains_all_word_semantics() {
+        let query = sql("O'Brien invoice"); assert!(query.contains("O''Brien"));
+        assert_eq!(query.matches("CONTAINS").count(), 2); assert!(query.contains("TOP 1000"));
+    }
 }

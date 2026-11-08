@@ -2,12 +2,12 @@
 //! own Win+Space (input-language switch) never sees it.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
-    VK_SPACE,
+    VK_SPACE, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, SetWindowsHookExW, TranslateMessage,
@@ -16,6 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 static SPACE_HELD: AtomicBool = AtomicBool::new(false);
 static ON_PRESS: OnceLock<fn()> = OnceLock::new();
+static HOTKEY: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_hotkey(key: crate::settings::Hotkey) { HOTKEY.store(key as u8, Ordering::Relaxed); }
 
 /// Installs the hook on its own thread (low-level hooks need a message loop).
 pub fn spawn(on_press: fn()) {
@@ -45,9 +48,14 @@ unsafe extern "system" fn callback(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             // (lock screen, admin window focused) would make plain Space trigger.
             let held = |vk: VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
             let win = held(VK_LWIN) || held(VK_RWIN);
-            if down && win {
+            let ctrl = held(VK_CONTROL); let alt = held(VK_MENU); let shift = held(VK_SHIFT);
+            let active = !shift && match HOTKEY.load(Ordering::Relaxed) {
+                1 => alt && !ctrl && !win, 2 => ctrl && !alt && !win,
+                3 => ctrl && alt && !win, _ => win && !ctrl && !alt,
+            };
+            if down && active {
                 if !SPACE_HELD.swap(true, Ordering::Relaxed) {
-                    send_mask_key();
+                    if win || alt { send_mask_key(); }
                     if let Some(f) = ON_PRESS.get() {
                         f();
                     }

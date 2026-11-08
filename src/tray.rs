@@ -56,6 +56,7 @@ pub fn spawn() {
 
 /// Removes the icon first so it does not linger in the notification area.
 pub fn quit() -> ! {
+    crate::storage::flush();
     let window = WINDOW.load(Ordering::Relaxed);
     if window != 0 {
         let data = icon_data(HWND(window as *mut c_void));
@@ -70,6 +71,15 @@ fn icon_data(window: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: window, uID: 1, ..Default::default() }
 }
 
+pub fn refresh_tip() {
+    let window = WINDOW.load(Ordering::Relaxed);
+    if window == 0 { return; }
+    let mut data = icon_data(HWND(window as *mut c_void)); data.uFlags = NIF_TIP;
+    let tip: Vec<u16> = format!("Lumen · {} to search", crate::settings::get().hotkey.label()).encode_utf16().collect();
+    data.szTip[..tip.len()].copy_from_slice(&tip);
+    let _ = unsafe { Shell_NotifyIconW(windows::Win32::UI::Shell::NIM_MODIFY, &data) };
+}
+
 unsafe fn add(window: HWND) {
     let mut data = icon_data(window);
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
@@ -80,7 +90,7 @@ unsafe fn add(window: HWND) {
         ICON.store(icon.0 as isize, Ordering::Relaxed);
     }
     data.hIcon = HICON(ICON.load(Ordering::Relaxed) as *mut c_void);
-    let tip: Vec<u16> = "Lumen · Win+Space to search".encode_utf16().collect();
+    let tip: Vec<u16> = format!("Lumen · {} to search", crate::settings::get().hotkey.label()).encode_utf16().collect();
     data.szTip[..tip.len()].copy_from_slice(&tip);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &data);

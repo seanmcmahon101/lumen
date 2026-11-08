@@ -79,6 +79,7 @@ pub fn signal_running() {
 
 /// Safe to call from any thread (the hook calls it).
 pub fn show() {
+    crate::metrics::opening();
     // Resolve the active app before Lumen takes focus. Leave capture and window
     // creation to the UI thread so they cannot delay the keyboard hook.
     let monitor = unsafe { active_monitor() };
@@ -261,7 +262,7 @@ unsafe fn capture(r: RECT) -> Option<eframe::egui::ColorImage> {
         if lines == 0 {
             return None;
         }
-        for p in bits.chunks_exact_mut(4) {
+        for p in bits.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
             p[3] = 255;
         }
@@ -338,9 +339,9 @@ pub fn load_icon(path: &str) -> Option<eframe::egui::ColorImage> {
             return None;
         }
         // Old-style icons have no alpha at all: treat as opaque.
-        let has_alpha = bits.chunks_exact(4).any(|p| p[3] != 0);
+        let has_alpha = bits.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
         let mut rgba = Vec::with_capacity(bits.len());
-        for p in bits.chunks_exact(4) {
+        for p in bits.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[p[2], p[1], p[0], if has_alpha { p[3] } else { 255 }]);
         }
         Some(eframe::egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], &rgba))
@@ -357,14 +358,7 @@ pub struct History {
 
 impl History {
     fn file(name: &str) -> Option<std::path::PathBuf> {
-        std::env::var("APPDATA").ok().map(|p| std::path::Path::new(&p).join("Lumen").join(name))
-    }
-
-    fn write(name: &str, json: serde_json::Result<Vec<u8>>) {
-        if let (Some(f), Ok(json)) = (Self::file(name), json) {
-            let _ = std::fs::create_dir_all(f.parent().unwrap());
-            let _ = std::fs::write(f, json);
-        }
+        crate::storage::directory().map(|p| p.join(name))
     }
 
     pub fn load() -> Self {
@@ -380,7 +374,7 @@ impl History {
 
     pub fn bump(&mut self, key: &str) {
         *self.counts.entry(key.to_string()).or_default() += 1;
-        Self::write("history.json", serde_json::to_vec(&self.counts));
+        crate::storage::save("history.json", &self.counts);
     }
 
     /// The path last opened after typing `query`.
@@ -393,7 +387,7 @@ impl History {
         for key in pick_keys(query) {
             self.picks.insert(key, path.to_string());
         }
-        Self::write("picks.json", serde_json::to_vec(&self.picks));
+        crate::storage::save("picks.json", &self.picks);
     }
 }
 

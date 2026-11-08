@@ -18,7 +18,7 @@ const SKIP_DIRS: &[&str] = &["appdata", "node_modules", "bin", "obj", "__pycache
 const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     App,
     Folder,
@@ -26,7 +26,7 @@ pub enum Kind {
     Email,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub name: String,
     lower: String,
@@ -42,6 +42,13 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Search results carry display metadata; workbook text stays in the index.
+    fn result(&self) -> Self {
+        Self { name: self.name.clone(), lower: self.lower.clone(), path: self.path.clone(), kind: self.kind,
+            depth: self.depth, location: self.location.clone(), content: String::new(), detail: self.detail.clone(),
+            stamp: self.stamp, read: self.read, penalty: self.penalty }
+    }
+
     pub(crate) fn new(name: String, path: String, kind: Kind, depth: usize) -> Self {
         let (lower, location) = (name.to_lowercase(), path.to_lowercase());
         Self {
@@ -182,9 +189,29 @@ pub struct Index {
     mapped: RwLock<HashMap<String, Arc<Vec<Entry>>>>,
     scanning_drives: Mutex<HashSet<String>>,
     changes: RwLock<Arc<Changes>>,
+    cached: AtomicBool,
 }
 
 impl Index {
+    /// Load the previous snapshot off-thread, then reconcile it with the disk.
+    pub fn start(self: &Arc<Self>, on_done: impl Fn() + Send + Sync + 'static) {
+        let me = self.clone();
+        std::thread::spawn(move || {
+            if let Some(entries) = load_cache(&crate::settings::get()) {
+                *me.entries.write().unwrap() = Arc::new(entries);
+                me.cached.store(true, Ordering::Relaxed);
+                me.generation.fetch_add(1, Ordering::Relaxed);
+                on_done();
+            }
+            me.rebuild(on_done);
+        });
+    }
+
+    pub fn stats(&self) -> (usize, bool) {
+        (self.entries.read().unwrap().len() + self.mapped.read().unwrap().values().map(|e| e.len()).sum::<usize>()
+            + self.changes.read().unwrap().added.len(), self.cached.load(Ordering::Relaxed))
+    }
+
     pub fn is_building(&self) -> bool {
         self.building.load(Ordering::Acquire) || !self.scanning_drives.lock().unwrap().is_empty()
     }
@@ -202,17 +229,31 @@ impl Index {
     // per requeue, and the compiler stops instantiating that chain at its
     // recursion limit.
     fn rebuild_impl(self: &Arc<Self>, on_done: Arc<dyn Fn() + Send + Sync + 'static>) {
+        let settings = crate::settings::get();
+        let roots = if settings.profile { mapped_roots() } else {
+            settings.folders.iter().filter(|root| !local_path(root)).cloned().collect()
+        };
+        {
+            let mut mapped = self.mapped.write().unwrap(); let previous = mapped.len();
+            mapped.retain(|root, _| roots.iter().any(|r| r.eq_ignore_ascii_case(root)));
+            if mapped.len() != previous { self.generation.fetch_add(1, Ordering::Relaxed); on_done(); }
+        }
         // Each mapped share has its own worker: a disconnected server cannot hold
         // up local indexing, another drive, or the search/render threads.
         let (network_index, network_done) = (self.clone(), on_done.clone());
         std::thread::spawn(move || {
-            for root in mapped_roots() {
+            if !crate::settings::get().files && !crate::settings::get().excel { return; }
+            for root in roots {
+                if crate::settings::get().excluded(&root) { continue; }
                 if !network_index.scanning_drives.lock().unwrap().insert(root.clone()) {
                     continue;
                 }
                 let (index, done) = (network_index.clone(), network_done.clone());
                 std::thread::spawn(move || {
                     scan_mapped(&root, |entries| {
+                        let current = crate::settings::get();
+                        if (!current.files && !current.excel) || current.excluded(&root)
+                            || (!current.profile && !current.folders.iter().any(|p| p.eq_ignore_ascii_case(&root))) { return; }
                         index.mapped.write().unwrap().insert(root.clone(), Arc::new(entries.to_vec()));
                         index.generation.fetch_add(1, Ordering::Relaxed);
                         done();
@@ -231,14 +272,16 @@ impl Index {
         self.rebuild_again.store(false, Ordering::SeqCst);
         let me = self.clone();
         std::thread::spawn(move || {
+            let settings = crate::settings::get();
+            let revision = crate::settings::REVISION.load(Ordering::Acquire);
             let publish = |list: Vec<Entry>| {
                 *me.entries.write().unwrap() = Arc::new(list);
                 me.generation.fetch_add(1, Ordering::Relaxed);
                 on_done();
             };
             let previous = me.entries.read().unwrap().clone();
-            let mut list = start_apps();
-            if list.is_empty() {
+            let mut list = if settings.apps { start_apps() } else { Vec::new() };
+            if list.is_empty() && settings.apps {
                 start_menu_shortcuts(&mut list);
             }
             // The first scan shows apps at once; a refresh keeps searching the
@@ -247,7 +290,7 @@ impl Index {
                 publish(list.clone());
             }
             let walk_started = Instant::now();
-            profile_files(&mut list);
+            if settings.files || settings.excel { profile_files(&mut list); }
             // Text read last time is still right for files that have not changed.
             let mut content_bytes = reuse_content(&mut list, &previous);
             drop(previous);
@@ -265,6 +308,10 @@ impl Index {
             publish(list);
             me.building.store(false, Ordering::SeqCst);
             on_done();
+            if revision == crate::settings::REVISION.load(Ordering::Acquire) {
+                let snapshot = me.entries.read().unwrap().clone();
+                save_cache(&settings, &snapshot);
+            }
             if me.rebuild_again.swap(false, Ordering::SeqCst) {
                 me.rebuild_impl(on_done.clone());
             }
@@ -283,6 +330,8 @@ impl Index {
 
     /// Applies what a watch on `root` saw: names at once, then new workbook text.
     pub fn apply(&self, root: &std::path::Path, changes: Vec<Change>, on_change: &dyn Fn()) {
+        let settings = crate::settings::get();
+        if !settings.files && !settings.excel { return; }
         let now = Instant::now();
         // Read the disk first; the overlay is locked only to record the result.
         let mut found: Vec<Result<Entry, String>> = Vec::new();
@@ -291,6 +340,7 @@ impl Index {
             match change {
                 Change::Removed(path) => found.push(Err(path.to_string_lossy().to_lowercase())),
                 Change::Added(path) | Change::Modified(path) => {
+                    if settings.excluded(&path.to_string_lossy()) { continue; }
                     let Some(depth) = watched_depth(root, &path) else { continue };
                     let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -340,19 +390,20 @@ impl Index {
 
     /// The indexed entry with this exact path.
     pub fn get(&self, path: &str) -> Option<Entry> {
+        let settings = crate::settings::get();
         let location = path.to_lowercase();
         let changes = self.changes.read().unwrap().clone();
         if let Some(e) = changes.added.iter().find(|e| e.location == location) {
-            return Some(e.clone());
+            return allowed(e, &settings).then(|| e.clone());
         }
         if changes.hides(&location) {
             return None;
         }
         let entries = self.entries.read().unwrap().clone();
         if let Some(e) = entries.iter().find(|e| e.location == location) {
-            return Some(e.clone());
+            return allowed(e, &settings).then(|| e.clone());
         }
-        self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.location == location).cloned())
+        self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.location == location && allowed(e, &settings)).cloned())
     }
 
     pub fn search(&self, query: &str, max: usize, uses: impl Fn(&str) -> u32 + Sync) -> Vec<Entry> {
@@ -396,11 +447,16 @@ impl Index {
         // take slices from busy ones, since workbook text is unevenly spread.
         // Scanned entries are checked against later changes; watched additions are not.
         let changes = self.changes.read().unwrap().clone();
-        let hides = |e: &Entry| changes.hides(&e.location);
-        let check: Option<&(dyn Fn(&Entry) -> bool + Sync)> = (!changes.is_empty()).then_some(&hides);
-        let mut chunks: Vec<(&[Entry], Option<&(dyn Fn(&Entry) -> bool + Sync)>)> =
+        let settings = crate::settings::get();
+        let filtering = !settings.apps || !settings.files || !settings.excel || !settings.mail || !settings.exclusions.is_empty();
+        let visible = |e: &Entry| allowed(e, &settings);
+        let hides = |e: &Entry| changes.hides(&e.location) || !visible(e);
+        let check: Option<&(dyn Fn(&Entry) -> bool + Sync)> = (!changes.is_empty() || filtering).then_some(&hides);
+        let hides_added = |e: &Entry| !visible(e);
+        let added_check: Option<&(dyn Fn(&Entry) -> bool + Sync)> = filtering.then_some(&hides_added);
+        let mut chunks: Vec<SearchChunk<'_>> =
             snapshots.iter().flat_map(|entries| entries.chunks(CHUNK)).map(|chunk| (chunk, check)).collect();
-        chunks.extend(changes.added.chunks(CHUNK).map(|chunk| (chunk, None)));
+        chunks.extend(changes.added.chunks(CHUNK).map(|chunk| (chunk, added_check)));
         let mut best: Vec<(i32, (usize, usize), &Entry)> = chunks
             .par_iter()
             .enumerate()
@@ -410,12 +466,21 @@ impl Index {
             })
             .collect();
         best.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        best.into_iter().take(max).map(|(_, _, e)| e.clone()).collect()
+        best.into_iter().take(max).map(|(_, _, e)| e.result()).collect()
     }
 }
 
 /// Entries per search slice.
 const CHUNK: usize = 2048;
+type EntryPredicate<'a> = dyn Fn(&Entry) -> bool + Sync + 'a;
+type SearchChunk<'a> = (&'a [Entry], Option<&'a EntryPredicate<'a>>);
+
+fn allowed(e: &Entry, settings: &crate::settings::Settings) -> bool {
+    !settings.excluded(&e.path) && match e.kind {
+        Kind::App => settings.apps, Kind::Folder => settings.files || settings.excel,
+        Kind::File => if spreadsheet(&e.lower) { settings.excel } else { settings.files }, Kind::Email => settings.mail,
+    }
+}
 
 struct Query<'a> {
     scope: &'a str,
@@ -433,6 +498,8 @@ fn best_in<'e>(
     uses: &impl Fn(&str) -> u32,
     hidden: Option<&(dyn Fn(&Entry) -> bool + Sync)>,
 ) -> Vec<(i32, usize, &'e Entry)> {
+    // A scrollable search can request every match without allocating usize::MAX.
+    let max = max.min(entries.len());
     // A min-heap: the weakest kept result is on top, and on equal scores the later entry.
     let mut heap: BinaryHeap<Reverse<(i32, Reverse<usize>)>> = BinaryHeap::with_capacity(max + 1);
     for (i, e) in entries.iter().enumerate() {
@@ -495,23 +562,23 @@ pub fn split_filter(query: &str) -> (&str, &str) {
 }
 
 fn mapped_roots() -> Vec<String> {
-    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $roots=@([IO.DriveInfo]::GetDrives() | Where-Object {$_.DriveType -eq 'Network'} | ForEach-Object {$_.Name}); ConvertTo-Json -InputObject $roots -Compress";
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| serde_json::from_slice(&output.stdout).ok())
-        .unwrap_or_default()
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let drives = unsafe { GetLogicalDrives() };
+    (0..26).filter_map(|i| {
+        if drives & (1 << i) == 0 { return None; }
+        let root = format!("{}:\\", (b'A' + i) as char);
+        (unsafe { GetDriveTypeW(&windows::core::HSTRING::from(&root)) } == 4).then_some(root)
+    }).collect()
 }
 
 fn scan_mapped(root: &str, mut publish: impl FnMut(&[Entry])) {
+    let settings = crate::settings::get();
     let mut entries = Vec::new();
     let mut queue = VecDeque::from([(PathBuf::from(root), 0usize)]);
     let start = Instant::now();
     let mut last_publish = Instant::now();
     while let Some((dir, depth)) = queue.pop_front() {
+        if settings.excluded(&dir.to_string_lossy()) { continue; }
         if start.elapsed() > Duration::from_secs(30) {
             break;
         }
@@ -534,6 +601,7 @@ fn scan_mapped(root: &str, mut publish: impl FnMut(&[Entry])) {
                 continue;
             }
             let path = child.path();
+            if settings.excluded(&path.to_string_lossy()) { continue; }
             entries.push(Entry::new(
                 name.clone(),
                 path.to_string_lossy().into_owned(),
@@ -674,6 +742,7 @@ fn needs_reading(lower_name: &str) -> bool {
 // Never hydrate cloud placeholders while building the local content index.
 fn enrich(e: &mut Entry) {
     e.read = false;
+    if !allowed(e, &crate::settings::get()) { return; }
     if e.kind != Kind::File || !needs_reading(&e.lower) {
         e.read = true;
         return;
@@ -833,14 +902,18 @@ fn start_menu_shortcuts(list: &mut Vec<Entry>) {
 /// and OneDrive. The rest of the profile is scanned after them.
 pub fn scan_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Ok(profile) = std::env::var("USERPROFILE") {
+    let settings = crate::settings::get();
+    if let Ok(profile) = std::env::var("USERPROFILE") && settings.profile {
         roots.extend(["Documents", "Desktop", "Downloads"].iter().map(|name| PathBuf::from(&profile).join(name)));
     }
     for variable in ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] {
+        if !settings.profile { break; }
         if let Ok(path) = std::env::var(variable) {
             roots.push(PathBuf::from(path));
         }
     }
+    roots.extend(settings.folders.iter().map(PathBuf::from));
+    roots.retain(|root| !settings.excluded(&root.to_string_lossy()));
     roots
 }
 
@@ -848,16 +921,18 @@ fn profile_files(list: &mut Vec<Entry>) {
     let Ok(profile) = std::env::var("USERPROFILE") else {
         return;
     };
-    let mut queue: VecDeque<_> = scan_roots().into_iter().map(|dir| (dir, 0)).collect();
-    queue.push_back((PathBuf::from(profile), 0));
+    let mut queue: VecDeque<_> = scan_roots().into_iter().filter(|p| local_path(&p.to_string_lossy())).map(|dir| (dir, 0)).collect();
+    if crate::settings::get().profile { queue.push_back((PathBuf::from(profile), 0)); }
     walk(queue, list, MAX_FILES);
 }
 
 /// Breadth-first walk, so a hit cap drops the deepest files first.
 fn walk(mut queue: VecDeque<(PathBuf, usize)>, list: &mut Vec<Entry>, limit: usize) {
+    let settings = crate::settings::get();
     let mut visited = HashSet::new();
     let mut count = 0;
     while let Some((dir, depth)) = queue.pop_front() {
+        if settings.excluded(&dir.to_string_lossy()) { continue; }
         if !visited.insert(dir.to_string_lossy().to_lowercase()) {
             continue;
         }
@@ -868,6 +943,7 @@ fn walk(mut queue: VecDeque<(PathBuf, usize)>, list: &mut Vec<Entry>, limit: usi
             let name = de.file_name().to_string_lossy().into_owned();
             let Ok(md) = de.metadata() else { continue };
             let path = de.path();
+            if settings.excluded(&path.to_string_lossy()) { continue; }
             let Some(e) = scanned_entry(name, &path, &md, depth + 1) else { continue };
             let descend = e.kind == Kind::Folder && descends(&e, &md);
             list.push(e);
@@ -915,9 +991,11 @@ fn watched_depth(root: &Path, path: &Path) -> Option<usize> {
 /// Copies text read by the previous scan into files whose size, date and attributes
 /// have not changed, and returns how much it copied.
 fn reuse_content(list: &mut [Entry], previous: &[Entry]) -> usize {
+    let settings = crate::settings::get();
     let known: HashMap<&str, &Entry> = previous.iter().filter(|e| e.read).map(|e| (e.path.as_str(), e)).collect();
     let mut bytes = 0;
     for e in list.iter_mut().filter(|e| e.kind == Kind::File) {
+        if !allowed(e, &settings) { continue; }
         if let Some(old) = known.get(e.path.as_str())
             && old.stamp == e.stamp
         {
@@ -930,9 +1008,51 @@ fn reuse_content(list: &mut [Entry], previous: &[Entry]) -> usize {
     bytes
 }
 
+fn cache_file() -> Option<PathBuf> {
+    std::env::var_os("LUMEN_DATA_DIR").map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Lumen")))
+        .map(|p| p.join("index-v1.json"))
+}
+
+fn decode_cache(bytes: &[u8], settings: &crate::settings::Settings) -> Option<Vec<Entry>> {
+    let (version, saved_settings, entries): (u8, crate::settings::Settings, Vec<Entry>) = serde_json::from_slice(bytes).ok()?;
+    (version == 1 && saved_settings == *settings && entries.len() <= MAX_FILES + 10_000).then_some(entries)
+}
+
+fn load_cache(settings: &crate::settings::Settings) -> Option<Vec<Entry>> {
+    let file = cache_file()?;
+    if std::fs::metadata(&file).ok()?.len() > 256 * 1024 * 1024 { return None; }
+    decode_cache(&std::fs::read(file).ok()?, settings)
+}
+
+fn save_cache(settings: &crate::settings::Settings, entries: &[Entry]) {
+    if let (Some(file), Ok(bytes)) = (cache_file(), serde_json::to_vec(&(1u8, settings, entries))) {
+        let _ = crate::storage::atomic_write(&file, &bytes);
+    }
+}
+
+/// Preview workers never try to hydrate a remote file or block on an SMB share.
+pub fn local_path(path: &str) -> bool {
+    if path.starts_with("\\\\") { return false; }
+    let path = path.replace('/', "\\");
+    path.get(..3).is_some_and(|root| unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(&windows::core::HSTRING::from(root)) != 4 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_roundtrip_keeps_search_text_and_rejects_stale_configuration() {
+        let settings = crate::settings::Settings::default();
+        let mut e = Entry::new("budget.xlsx".into(), r"C:\Work\budget.xlsx".into(), Kind::File, 2);
+        e.content = "revenue forecast".into(); e.read = true; e.stamp = (42, 123, 0);
+        let bytes = serde_json::to_vec(&(1u8, &settings, vec![e])).unwrap();
+        let loaded = decode_cache(&bytes, &settings).unwrap(); assert_eq!(loaded[0].content, "revenue forecast");
+        assert_eq!(loaded[0].stamp, (42, 123, 0));
+        let mut changed = settings.clone(); changed.exclusions.push(r"C:\Work".into());
+        assert!(decode_cache(&bytes, &changed).is_none()); assert!(decode_cache(b"broken", &settings).is_none());
+    }
 
     fn idx(items: &[(&str, Kind)]) -> Index {
         let index = Index::default();
@@ -968,6 +1088,23 @@ mod tests {
         assert_eq!(names("budget", 5), ["budget.xlsx", "budget old.xlsx"]);
         assert_eq!(names("tie", 1), ["tie b"], "equal scores keep index order");
         assert_eq!(names("file 1", 3).len(), 3);
+    }
+
+    #[test]
+    fn unlimited_search_returns_every_match_in_stable_rank_order() {
+        let count = CHUNK * 3 + 17;
+        let items: Vec<_> = (0..count).map(|i| (format!("budget {i:05}.xlsx"), Kind::File)).collect();
+        let refs: Vec<_> = items.iter().map(|(name, kind)| (name.as_str(), *kind)).collect();
+        let index = idx(&refs);
+        let all = index.search("excel budget", usize::MAX, |_| 0);
+        assert_eq!(all.len(), count);
+        for (i, entry) in all.iter().enumerate() {
+            assert_eq!(entry.name, items[i].0, "ties stay in index order across search slices");
+        }
+        let first = index.search("excel budget", 7, |_| 0);
+        assert_eq!(first.iter().map(|e| &e.path).collect::<Vec<_>>(), all[..7].iter().map(|e| &e.path).collect::<Vec<_>>());
+        assert!(index.search("excel missing", usize::MAX, |_| 0).is_empty());
+        assert!(index.search("excel budget", 0, |_| 0).is_empty());
     }
 
     #[test]
@@ -1260,6 +1397,14 @@ mod tests {
             println!("not scanned: {}", e.path);
         }
         let index = Index::default();
+        let cache_started = Instant::now();
+        let settings = crate::settings::get();
+        let cache = serde_json::to_vec(&(1u8, &settings, &list)).unwrap();
+        let encode_time = cache_started.elapsed();
+        let load_started = Instant::now();
+        let loaded = decode_cache(&cache, &settings).unwrap();
+        println!("cache {:.1} MB: encode {encode_time:?}, decode {:?} ({} entries)", cache.len() as f64 / 1048576., load_started.elapsed(), loaded.len());
+        drop(loaded); drop(cache);
         let without_content: Vec<Entry> = list.iter().map(|e| Entry { content: String::new(), ..e.clone() }).collect();
         let bare = Index::default();
         *bare.entries.write().unwrap() = Arc::new(without_content);
@@ -1267,14 +1412,14 @@ mod tests {
         rayon::broadcast(|_| ());
         for q in ["b", "bu", "bud", "budget", "excel budget", "excel bud", "report 2026", "accounts", "zzqx", "zzqx yyqw"] {
             let rounds = 20;
-            let time = |index: &Index| {
+            let time = |index: &Index, max| {
                 let start = Instant::now();
                 for _ in 0..rounds {
-                    std::hint::black_box(index.search(q, 7, |_| 0));
+                    std::hint::black_box(index.search(q, max, |_| 0));
                 }
                 start.elapsed() / rounds
             };
-            println!("{q:>14}: {:?} (names only {:?})", time(&index), time(&bare));
+            println!("{q:>14}: top 7 {:?}, all {:?} (names only {:?})", time(&index, 7), time(&index, usize::MAX), time(&bare, 7));
         }
     }
 

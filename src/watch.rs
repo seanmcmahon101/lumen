@@ -3,7 +3,7 @@
 
 use crate::index::{Change, Index};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc, atomic::{AtomicBool, Ordering}};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
@@ -14,19 +14,37 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::HSTRING;
 
 /// One thread per watched folder, each waiting on Windows for changes.
-pub fn spawn(index: Arc<Index>, on_change: impl Fn() + Send + Sync + 'static) {
+pub fn spawn(index: Arc<Index>, on_change: impl Fn() + Send + Sync + 'static) -> mpsc::Sender<()> {
     let on_change = Arc::new(on_change);
-    for root in watched_roots() {
-        let (index, on_change) = (index.clone(), on_change.clone());
-        std::thread::spawn(move || watch(&root, &index, on_change));
-    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::os::windows::io::AsRawHandle;
+        loop {
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut workers = Vec::new();
+            let settings = crate::settings::get();
+            if settings.files || settings.excel {
+                for root in watched_roots() {
+                    let (index, on_change, stop) = (index.clone(), on_change.clone(), stop.clone());
+                    workers.push(std::thread::spawn(move || watch(&root, &index, on_change, stop)));
+                }
+            }
+            let finished = rx.recv().is_err();
+            stop.store(true, Ordering::Release);
+            for worker in workers {
+                let _ = unsafe { windows::Win32::System::IO::CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+            }
+            if finished { break; }
+        }
+    });
+    tx
 }
 
 /// The scanned folders that exist, leaving out any inside another, so each change is seen once.
 fn watched_roots() -> Vec<PathBuf> {
     let inside = |path: &str, folder: &str| path == folder || path.starts_with(&format!("{folder}\\"));
     let mut kept: Vec<(PathBuf, String)> = Vec::new();
-    for root in crate::index::scan_roots().into_iter().filter(|root| root.is_dir()) {
+    for root in crate::index::scan_roots().into_iter().filter(|root| crate::index::local_path(&root.to_string_lossy()) && root.is_dir()) {
         let lower = root.to_string_lossy().to_lowercase();
         if kept.iter().any(|(_, folder)| inside(&lower, folder)) {
             continue;
@@ -37,9 +55,11 @@ fn watched_roots() -> Vec<PathBuf> {
     kept.into_iter().map(|(root, _)| root).collect()
 }
 
-fn watch(root: &Path, index: &Arc<Index>, on_change: Arc<impl Fn() + Send + Sync + 'static>) {
+fn watch(root: &Path, index: &Arc<Index>, on_change: Arc<impl Fn() + Send + Sync + 'static>, stop: Arc<AtomicBool>) {
     let Ok(mut watcher) = DirectoryWatch::open(root) else { return };
-    while let Ok(changes) = watcher.read() {
+    while !stop.load(Ordering::Acquire) {
+        let Ok(changes) = watcher.read() else { break; };
+        if stop.load(Ordering::Acquire) { break; }
         if let Some(changes) = changes {
             index.apply(root, changes, &*on_change);
         } else {
