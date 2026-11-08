@@ -26,7 +26,7 @@ Escape returns from a command to your previous search, then closes Lumen.
 | `/calc expression` | Calculate and copy the answer, for example `/calc 125 * 1.2`. Ordinary arithmetic also works without a command. |
 | `/convert value unit in unit` | Offline conversion, for example `/convert 10 miles in km`, `/convert 2 GiB in MiB`, or `/convert 32 F in C`. Also works without the command. |
 | `/date [calculation]` | Today's local date, `today + 30 days`, `today + 2 weeks`, or `2026-12-25 - today`. Use `YYYY-MM-DD` for dates; Enter copies the answer. Date calculations also work in ordinary search. |
-| `/settings` | Change the opening shortcut, search sources, profile coverage, additional folders and exclusions. Save applies changes and refreshes search in the background. |
+| `/settings` | Change the theme, the opening shortcut, search sources, profile coverage, additional folders and exclusions. The theme previews as you choose it. Save applies changes and refreshes search in the background when search settings changed. |
 | `/reindex`, `/status` | Refresh the index or inspect its progress, approximate size, folders and enabled sources. |
 | `/perf` | View recent and p95 opening, local search and result-display timings, working-set memory, and CPU since the previous `/perf` snapshot. Leave Lumen idle between snapshots to inspect idle CPU. |
 
@@ -77,8 +77,14 @@ scrollable list. Use the mouse wheel, a trackpad or the scrollbar to browse;
 the search bar and shortcuts stay in place. Up/Down moves the selection,
 Page Up/Page Down moves a page, and Ctrl+Home/Ctrl+End jumps to the first/last
 result. The list follows keyboard selection and starts at the top for a new
-search. A counter shows the visible range and total results. Up to eight rows
-are visible at once, fewer on a short display; only visible rows are drawn.
+search. When results overflow, a counter shows the visible range and total. Up
+to eight rows are visible at once, fewer on a short display; only visible rows
+are drawn. The selected row shows what Enter will do.
+
+Lumen follows Windows' light or dark app mode and accent color, and uses
+Segoe UI Variable on Windows 11 (Segoe UI on Windows 10). Choose Light or Dark
+in `/settings` to override the mode. Opening dims the desktop over 0.2 seconds
+unless Windows animation effects are turned off.
 
 ## Install on Windows
 

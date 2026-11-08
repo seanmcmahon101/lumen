@@ -45,20 +45,22 @@ impl Lumen {
     }
 
     pub(super) fn home_results(&mut self) {
-        for saved in &self.library.pins {
+        for (i, saved) in self.library.pins.iter().enumerate() {
             let mut item = self.saved_item(saved);
-            item.label = "Pinned".into();
+            item.header = (i == 0).then_some("Pinned");
             self.results.push(item);
         }
-        for saved in self
+        let recent: Vec<Saved> = self
             .library
             .recent
             .iter()
             .filter(|s| !self.library.pinned(&s.path))
             .take(5)
-        {
+            .cloned()
+            .collect();
+        for (i, saved) in recent.iter().enumerate() {
             let mut item = self.saved_item(saved);
-            item.label = "Recent".into();
+            item.header = (i == 0).then_some("Recent");
             self.results.push(item);
         }
         if self.results.is_empty() {
@@ -66,7 +68,7 @@ impl Lumen {
                 "Welcome to Lumen",
                 "Type to search, or open /help for commands and examples",
                 "Help",
-                G_SEARCH,
+                G_HELP,
                 Action::Query("/help".into()),
             ));
         }
@@ -97,8 +99,8 @@ impl Lumen {
         let mut item = simple(
             command.usage,
             command.description,
-            "Command",
-            G_SEARCH,
+            "",
+            command_glyph(command.name).unwrap_or(G_SEARCH),
             Action::Query(query.clone()),
         );
         item.complete = Some(query);
@@ -107,7 +109,14 @@ impl Lumen {
 
     fn info(&mut self, title: &str, detail: &str) {
         self.results
-            .push(simple(title, detail, "", G_SEARCH, Action::Noop));
+            .push(simple(title, detail, "", G_INFO, Action::Noop));
+    }
+
+    /// Starts a group: the next row pushed gets `header` above it.
+    fn group(&mut self, start: usize, header: &'static str) {
+        if let Some(item) = self.results.get_mut(start) {
+            item.header = Some(header);
+        }
     }
 
     fn target(&self, argument: &str) -> Option<Item> {
@@ -159,48 +168,55 @@ impl Lumen {
                         "Search apps, files, and folders",
                         "Type a name; Lumen learns which result you open",
                         "budget",
+                        G_SEARCH,
                     ),
                     (
                         "Search spreadsheets and their contents",
                         "excel finance revenue · ext:xlsm forecast",
                         "excel budget",
+                        G_SHEET,
                     ),
                     (
                         "Search Outlook mail",
                         "mail invoice · subjects, senders, and indexed text",
                         "mail invoice",
+                        G_MAIL,
                     ),
                     (
                         "Keyboard shortcuts",
                         "Enter open · Tab complete · Esc back/close · ↑↓ select",
                         "",
+                        G_KEYBOARD,
                     ),
                     (
                         "Result actions",
                         "Ctrl+K actions · Ctrl+P preview · Ctrl+D pin/unpin",
                         "/actions",
+                        G_MORE,
                     ),
                     (
                         "Open, reveal, or run as administrator",
                         "Ctrl+Enter reveal · Ctrl+Shift+Enter administrator · Ctrl+C copy",
                         "",
+                        G_OPEN,
                     ),
                     (
                         "Browse long result lists",
                         "Page Up/Down · Ctrl+Home/End · mouse wheel or scrollbar",
                         "",
+                        G_LIST,
                     ),
-                    ("Open Lumen", hotkey, ""),
+                    ("Open Lumen", hotkey, "", G_KEYBOARD),
                 ];
-                for (title, detail, example) in shortcuts {
+                for (title, detail, example, glyph) in shortcuts {
                     if !command::matches(&format!("{title} {detail}"), argument) {
                         continue;
                     }
                     self.results.push(simple(
                         title,
                         detail,
-                        "Guide",
-                        G_SEARCH,
+                        "",
+                        glyph,
                         if example.is_empty() {
                             Action::Noop
                         } else {
@@ -208,6 +224,8 @@ impl Lumen {
                         },
                     ));
                 }
+                self.group(0, "Basics");
+                let commands = self.results.len();
                 for command in COMMANDS.iter().filter(|c| {
                     command::matches(
                         &format!("{} {} {}", c.name, c.description, c.example),
@@ -216,6 +234,7 @@ impl Lumen {
                 }) {
                     self.results.push(Self::command_item(command));
                 }
+                self.group(commands, "Commands");
                 if self.results.is_empty() {
                     self.info(
                         "No matching help",
@@ -233,8 +252,7 @@ impl Lumen {
                     .iter()
                     .filter(|s| command::matches(&format!("{} {}", s.name, s.path), argument))
                 {
-                    let mut item = self.saved_item(saved);
-                    item.label = if name == "pins" { "Pinned" } else { "Recent" }.into();
+                    let item = self.saved_item(saved);
                     self.results.push(item);
                 }
                 if self.results.is_empty() {
@@ -293,8 +311,8 @@ impl Lumen {
                                 target.name
                             ),
                             &target.path,
-                            "Shortcut",
-                            G_OPEN,
+                            "",
+                            if name == "pin" { G_PIN } else { G_UNPIN },
                             if name == "pin" {
                                 Action::Pin(target.clone())
                             } else {
@@ -327,8 +345,8 @@ impl Lumen {
                             target.name
                         ),
                         &target.path,
-                        "Alias",
-                        G_OPEN,
+                        "",
+                        G_LINK,
                         Action::SetAlias(alias.into(), target.clone()),
                     ));
                 } else {
@@ -340,8 +358,8 @@ impl Lumen {
                     self.results.push(simple(
                         &format!("Remove alias {argument}"),
                         &format!("{} · the original item stays in place", saved.name),
-                        "Alias",
-                        G_OPEN,
+                        "",
+                        G_LINK,
                         Action::RemoveAlias(argument.to_lowercase()),
                     ));
                 } else {
@@ -360,8 +378,8 @@ impl Lumen {
                     self.results.push(simple(
                         &window.title,
                         "Switch to this open window",
-                        "Window",
-                        G_OPEN,
+                        "",
+                        G_WINDOWS,
                         Action::Switch(window.clone()),
                     ));
                 }
@@ -411,21 +429,23 @@ impl Lumen {
                         let _ = self.preview_tx.send(request);
                     }
                     let mut open = self.saved_item(&target);
-                    open.label = "Open file".into();
+                    open.header = Some("Workbook");
                     self.results.push(open);
+                    let excerpts = self.results.len();
                     match self.preview_lines.clone() {
                         Some(Ok(lines)) => {
                             for line in lines {
                                 let mut item = simple(
                                     &line.location,
                                     &line.text,
-                                    "Copy text",
-                                    G_CALC,
+                                    "",
+                                    G_SHEET,
                                     Action::Copy(line.text.clone()),
                                 );
                                 item.copy = Some(line.text);
                                 self.results.push(item);
                             }
+                            self.group(excerpts, "Matching cells");
                         }
                         Some(Err(error)) => self.info("Preview unavailable", &error),
                         None => self.info(
@@ -458,7 +478,12 @@ impl Lumen {
                     }),
                 };
                 if let Some(answer) = answer {
-                    self.results.push(answer_item(answer));
+                    let (glyph, label) = match name.as_str() {
+                        "convert" => (G_CONVERT, "Conversion"),
+                        "date" => (G_CALENDAR, "Date"),
+                        _ => (G_CALC, "Calculator"),
+                    };
+                    self.results.push(answer_item(answer, glyph, label));
                 } else {
                     let command = COMMANDS.iter().find(|c| c.name == name).unwrap();
                     self.info(
@@ -473,7 +498,7 @@ impl Lumen {
                         command.example,
                         "Select to try this example",
                         "Example",
-                        G_CALC,
+                        command_glyph(command.name).unwrap_or(G_CALC),
                         Action::Query(command.example.into()),
                     ));
                     if name == "convert" {
@@ -492,7 +517,7 @@ impl Lumen {
                 "Refresh the search index",
                 "Keep searching while files and spreadsheet contents are refreshed",
                 "Index",
-                G_SEARCH,
+                G_REFRESH,
                 Action::Reindex,
             )),
             "status" => {
@@ -505,7 +530,8 @@ impl Lumen {
                         "Index is ready"
                     },
                     &format!(
-                        "About {count} indexed items · {}",
+                        "About {} indexed items · {}",
+                        thousands(count),
                         if cached {
                             "saved index loaded at startup"
                         } else {
@@ -513,6 +539,7 @@ impl Lumen {
                         }
                     ),
                 );
+                self.group(0, "Index");
                 self.info(
                     "Enabled sources",
                     &format!(
@@ -523,26 +550,30 @@ impl Lumen {
                         on_off(settings.mail)
                     ),
                 );
+                let folders = self.results.len();
                 for root in crate::index::scan_roots() {
-                    self.info("Search folder", &root.to_string_lossy());
+                    let path = root.to_string_lossy();
+                    let name = root.file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+                    self.results.push(simple(&name, &path, "", G_FOLDER, Action::Noop));
                 }
+                self.group(folders, "Folders searched");
                 self.results.push(simple(
                     "Refresh now",
                     "Run /reindex to reconcile the index with your files",
                     "Index",
-                    G_SEARCH,
+                    G_REFRESH,
                     Action::Reindex,
                 ));
             }
             "perf" => {
                 for (title, note) in self.perf_rows.clone() {
-                    self.info(&title, &note);
+                    self.results.push(simple(&title, &note, "", G_SPEED, Action::Noop));
                 }
                 self.results.push(simple(
                     "Refresh measurements",
                     "Leave Lumen idle between snapshots to inspect idle CPU",
                     "Performance",
-                    G_SEARCH,
+                    G_REFRESH,
                     Action::Query("/perf".into()),
                 ));
             }
@@ -553,15 +584,14 @@ impl Lumen {
 
     fn action_results(&mut self, target: Item) {
         let mut open = target.clone();
-        open.subtitle = format!("Open · {}", target.title);
-        open.label = "Open".into();
+        open.label = "Enter".into();
         self.results.push(open);
         if let Some(path) = &target.reveal {
             self.results.push(simple(
                 "Reveal in File Explorer",
                 path,
                 "Ctrl+Enter",
-                G_OPEN,
+                G_REVEAL,
                 Action::Reveal(path.clone()),
             ));
         }
@@ -570,7 +600,7 @@ impl Lumen {
                 "Copy path",
                 path,
                 "Ctrl+C",
-                G_OPEN,
+                G_COPY,
                 Action::Copy(path.clone()),
             ));
         }
@@ -580,8 +610,8 @@ impl Lumen {
             self.results.push(simple(
                 "Run as administrator",
                 &target.title,
-                "Admin",
-                G_SETTINGS,
+                "Ctrl+Shift+Enter",
+                G_ADMIN,
                 Action::Admin(path.clone()),
             ));
         }
@@ -590,32 +620,32 @@ impl Lumen {
                 self.results.push(simple(
                     "Unpin this item",
                     &saved.name,
-                    "Shortcut",
-                    G_OPEN,
+                    "Ctrl+D",
+                    G_UNPIN,
                     Action::Unpin(saved.path.clone()),
                 ));
             } else {
                 self.results.push(simple(
                     "Pin this item",
                     &saved.name,
-                    "Shortcut",
-                    G_OPEN,
+                    "Ctrl+D",
+                    G_PIN,
                     Action::Pin(saved.clone()),
                 ));
             }
             self.results.push(simple(
                 "Create an alias…",
                 &format!("Give {} a short name", saved.name),
-                "Shortcut",
-                G_OPEN,
+                "",
+                G_LINK,
                 Action::BeginAlias(saved.clone()),
             ));
             if saved.kind != Kind::Email && std::path::Path::new(&saved.path).is_absolute() {
                 self.results.push(simple(
                     "Open terminal here",
                     &saved.path,
-                    "Terminal",
-                    G_OPEN,
+                    "",
+                    G_TERMINAL,
                     Action::Terminal(saved.path.clone()),
                 ));
             }
@@ -624,83 +654,11 @@ impl Lumen {
                     "Preview worksheet matches",
                     &saved.name,
                     "Ctrl+P",
-                    G_SEARCH,
+                    G_PREVIEW,
                     Action::Preview(saved.clone(), self.preview_terms.clone()),
                 ));
             }
         }
-    }
-
-    pub(super) fn load_settings_draft(&mut self) {
-        self.settings_draft = crate::settings::get();
-        self.settings_folders = self.settings_draft.folders.join("\n");
-        self.settings_exclusions = self.settings_draft.exclusions.join("\n");
-        self.settings_error.clear();
-    }
-
-    pub(super) fn draw_settings(&mut self, ui: &mut egui::Ui, bounds: Rect) {
-        let body = Rect::from_min_max(bounds.min + vec2(24., 12.), bounds.max - vec2(24., 62.));
-        ui.scope_builder(UiBuilder::new().max_rect(body).layout(Layout::top_down(Align::Min)), |ui| {
-            egui::ScrollArea::vertical().id_salt("preferences").auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing = vec2(12., 10.);
-                ui.style_mut().text_styles.insert(egui::TextStyle::Body, FontId::proportional(15.));
-                ui.heading("Lumen settings");
-                ui.horizontal(|ui| {
-                    ui.label("Open Lumen");
-                    egui::ComboBox::from_id_salt("hotkey").selected_text(self.settings_draft.hotkey.label()).show_ui(ui, |ui| {
-                        for hotkey in crate::settings::Hotkey::ALL { ui.selectable_value(&mut self.settings_draft.hotkey, hotkey, hotkey.label()); }
-                    });
-                });
-                ui.label(RichText::new("Search sources").strong());
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.settings_draft.apps, "Apps"); ui.checkbox(&mut self.settings_draft.files, "Files and folders");
-                    ui.checkbox(&mut self.settings_draft.excel, "Spreadsheets"); ui.checkbox(&mut self.settings_draft.mail, "Outlook");
-                });
-                ui.checkbox(&mut self.settings_draft.profile, "Search default locations: my profile, OneDrive, and mapped network drives");
-                ui.label(RichText::new("Additional folders").strong());
-                ui.label(RichText::new("One full path per line, for example C:\\Work. Use mapped drives for network folders.").color(SUBTLE));
-                ui.add(TextEdit::multiline(&mut self.settings_folders).background_color(GLYPH_BG).desired_rows(2).desired_width(f32::INFINITY).hint_text("C:\\Work"));
-                ui.label(RichText::new("Excluded folders").strong());
-                ui.add(TextEdit::multiline(&mut self.settings_exclusions).background_color(GLYPH_BG).desired_rows(2).desired_width(f32::INFINITY).hint_text("C:\\Work\\Archive"));
-                let (count, _) = self.index.stats();
-                ui.label(RichText::new(format!("{} · about {count} indexed items. Saving refreshes search in the background.", if self.index.is_building() { "Indexing" } else { "Ready" })).color(SUBTLE));
-            });
-        });
-        let footer = Rect::from_min_max(
-            pos2(bounds.left() + 24., bounds.bottom() - 54.),
-            bounds.max - vec2(24., 8.),
-        );
-        ui.scope_builder(
-            UiBuilder::new()
-                .max_rect(footer)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                if ui.button("Save settings").clicked() {
-                    self.settings_draft.folders =
-                        self.settings_folders.lines().map(str::to_string).collect();
-                    self.settings_draft.exclusions = self
-                        .settings_exclusions
-                        .lines()
-                        .map(str::to_string)
-                        .collect();
-                    match self.settings_draft.validate() {
-                        Ok(()) => {
-                            crate::settings::set(self.settings_draft.clone());
-                            let _ = self.watch_tx.send(());
-                            self.reindex();
-                            self.navigate("/status".into());
-                        }
-                        Err(error) => self.settings_error = error.into(),
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    self.navigate(self.return_query.clone());
-                }
-                if !self.settings_error.is_empty() {
-                    ui.colored_label(Color32::from_rgb(150, 36, 36), &self.settings_error);
-                }
-            },
-        );
     }
 
     pub(super) fn reindex(&self) {

@@ -14,16 +14,19 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+};
 use windows::Win32::System::Threading::{
     AttachThreadInput, CreateEventW, EVENT_MODIFY_STATE, GetCurrentThreadId, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
-    GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, ShowWindowAsync, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetWindowPos, ShowWindow, ShowWindowAsync, SystemParametersInfoW, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -32,7 +35,57 @@ static TARGET_MONITOR: AtomicIsize = AtomicIsize::new(0);
 pub static VISIBLE: AtomicBool = AtomicBool::new(false);
 pub static JUST_SHOWN: AtomicBool = AtomicBool::new(false);
 pub static CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
-pub const BACKDROP_BRIGHTNESS: u8 = 76;
+
+/// Whether Windows apps are in light mode (Settings › Personalization › Colors).
+pub fn apps_use_light_theme() -> bool {
+    let mut value = 1u32;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        let _ = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut c_void),
+            Some(&mut bytes),
+        );
+    }
+    value != 0
+}
+
+/// The accent color ramp Windows derives from the user's accent, lightest first:
+/// Light 3, 2, 1, the accent, Dark 1, 2, 3.
+pub fn accent_ramp() -> Option<[[u8; 3]; 7]> {
+    let mut palette = [0u8; 32];
+    let mut bytes = palette.len() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(palette.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    (status == ERROR_SUCCESS && bytes >= 28).then(|| std::array::from_fn(|i| [palette[i * 4], palette[i * 4 + 1], palette[i * 4 + 2]]))
+}
+
+/// Windows' "Animation effects" setting, which also asks apps for less motion.
+pub fn animations_enabled() -> bool {
+    let mut enabled = BOOL(1);
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut BOOL as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled.as_bool()
+}
 
 pub fn set_hwnd(h: isize) {
     HWND_VAL.store(h, Ordering::Relaxed);
@@ -127,7 +180,8 @@ pub struct DisplayOverlay {
 }
 
 impl DisplayOverlay {
-    pub fn open(&mut self) -> Option<eframe::egui::ColorImage> {
+    /// Captures the active display and dims the others to `brightness` (255 is undimmed).
+    pub fn open(&mut self, brightness: u8) -> Option<eframe::egui::ColorImage> {
         self.close();
         let selected = HMONITOR(TARGET_MONITOR.load(Ordering::Relaxed) as *mut c_void);
         let monitor = monitor_rect(selected).or_else(|| monitor_rect(unsafe { active_monitor() }))?;
@@ -138,19 +192,31 @@ impl DisplayOverlay {
         let mut others = Vec::<RECT>::new();
         let _ = unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(&mut others as *mut Vec<RECT> as isize)) };
         for rect in others.into_iter().filter(|rect| *rect != monitor) {
-            if let Some(window) = dim_monitor(rect) {
+            if let Some(window) = dim_monitor(rect, brightness) {
                 self.dimmers.push(window);
             }
         }
         backdrop
     }
 
+    /// Dims the other displays to `brightness`, as the room dims when Lumen opens.
+    pub fn dim(&self, brightness: u8) {
+        for window in &self.dimmers {
+            let _ = unsafe { SetLayeredWindowAttributes(*window, COLORREF(0), 255 - brightness, LWA_ALPHA) };
+        }
+    }
+
+    /// Covers the display plus one row below it. Windows presents a borderless OpenGL
+    /// window that exactly covers a monitor as full-screen, and after that window is
+    /// resized the screen can keep showing its first frame. The extra row is off-screen.
     pub fn fit(&self) {
         let Some(r) = self.monitor else { return };
+        let target = RECT { bottom: r.bottom + 1, ..r };
         unsafe {
             let mut current = RECT::default();
-            if GetWindowRect(hwnd(), &mut current).is_err() || current != r {
-                let _ = SetWindowPos(hwnd(), Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
+            if GetWindowRect(hwnd(), &mut current).is_err() || current != target {
+                let (w, h) = (target.right - target.left, target.bottom - target.top);
+                let _ = SetWindowPos(hwnd(), Some(HWND_TOPMOST), target.left, target.top, w, h, SWP_NOACTIVATE);
             }
         }
     }
@@ -183,7 +249,7 @@ unsafe extern "system" fn dimmer_window_proc(window: HWND, message: u32, wparam:
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-fn dim_monitor(r: RECT) -> Option<HWND> {
+fn dim_monitor(r: RECT, brightness: u8) -> Option<HWND> {
     static REGISTERED: OnceLock<bool> = OnceLock::new();
     let class = w!("Lumen.MonitorDimmer");
     unsafe {
@@ -215,7 +281,7 @@ fn dim_monitor(r: RECT) -> Option<HWND> {
             None,
         )
         .ok()?;
-        if SetLayeredWindowAttributes(window, COLORREF(0), 255 - BACKDROP_BRIGHTNESS, LWA_ALPHA).is_err()
+        if SetLayeredWindowAttributes(window, COLORREF(0), 255 - brightness, LWA_ALPHA).is_err()
             || SetWindowPos(window, Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW)
                 .is_err()
         {
