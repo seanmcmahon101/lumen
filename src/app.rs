@@ -1,11 +1,11 @@
-//! The overlay: dimmed screen, glowing search bar, results.
+//! The overlay: a dimmed desktop, the lit search panel, and its results.
 
 use crate::index::{Entry, Index, Kind};
 use crate::{calc, win};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Key, Layout, Margin, Modifiers, Pos2,
-    Rect, RichText, Sense, Shadow, TextEdit, TextureHandle, TextureOptions, UiBuilder, Vec2, pos2,
-    text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping},
+    self, Align, Align2, Color32, FontFamily, FontId, Id, Key, Layout, Margin, Modifiers, Pos2, Rect, Sense, Stroke, TextEdit,
+    TextureHandle, TextureOptions, UiBuilder, Vec2, pos2,
+    text::{CCursor, CCursorRange, LayoutJob, TextWrapping},
     vec2,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -13,28 +13,31 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+use theme::{Appearance, Palette, Slide};
 
 mod commands;
-
-const TEXT: Color32 = Color32::from_rgb(0x16, 0x18, 0x1C);
-const SUBTLE: Color32 = Color32::from_rgb(0x63, 0x69, 0x73);
-const HINT: Color32 = Color32::from_rgb(0x68, 0x6E, 0x78);
-const GHOST: Color32 = Color32::from_rgb(0xB4, 0xB8, 0xBF);
-const SELECTED: Color32 = Color32::from_rgb(0xEB, 0xEE, 0xF3);
-const HOVER: Color32 = Color32::from_rgb(0xF4, 0xF5, 0xF8);
-const DIVIDER: Color32 = Color32::from_rgb(0xEC, 0xED, 0xF0);
-const GLYPH_BG: Color32 = Color32::from_rgb(0xF0, 0xF1, 0xF4);
+mod paint;
+mod preferences;
+mod theme;
 
 const WIDTH: f32 = 760.0;
-const BAR_H: f32 = 80.0;
-const FILTER_H: f32 = 44.0;
-const TEXT_INSET: f32 = 68.0;
-const SEARCH_SIZE: f32 = 26.0;
-const ROW_H: f32 = 64.0;
+const BAR_H: f32 = 72.0;
+const FILTER_H: f32 = 40.0;
+/// The icon column's centre and the text column's start, from the panel's left edge.
+/// The search glyph, result icons, query, tabs and titles all hang off these two lines.
+const GLYPH_X: f32 = 36.0;
+const TEXT_X: f32 = 64.0;
+const SEARCH_SIZE: f32 = 24.0;
+const ROW_H: f32 = 56.0;
+const HEADER_H: f32 = 30.0;
 const LIST_PAD: f32 = 6.0;
 const FOOTER_H: f32 = 40.0;
+const EMPTY_H: f32 = 52.0;
 const MAX_VISIBLE_ROWS: usize = 8;
-const RADIUS: u8 = 18;
+const RADIUS: u8 = 16;
+const ROW_RADIUS: u8 = 8;
+/// How long the room takes to dim when Lumen opens.
+const OPEN_TIME: f64 = 0.2;
 
 // Segoe Fluent Icons code points
 const G_SEARCH: char = '\u{E721}';
@@ -43,6 +46,34 @@ const G_GLOBE: char = '\u{E774}';
 const G_POWER: char = '\u{E7E8}';
 const G_SETTINGS: char = '\u{E713}';
 const G_OPEN: char = '\u{E8A7}';
+const G_MAIL: char = '\u{E715}';
+const G_SHEET: char = '\u{E80A}';
+const G_FOLDER: char = '\u{E8B7}';
+const G_FILE: char = '\u{E8A5}';
+const G_APP: char = '\u{ECAA}';
+const G_PIN: char = '\u{E718}';
+const G_UNPIN: char = '\u{E77A}';
+const G_INFO: char = '\u{E946}';
+const G_HELP: char = '\u{E897}';
+const G_RETURN: char = '\u{E751}';
+const G_CALENDAR: char = '\u{E787}';
+const G_CONVERT: char = '\u{E8AB}';
+const G_HISTORY: char = '\u{E81C}';
+const G_LINK: char = '\u{E71B}';
+const G_WINDOWS: char = '\u{E7C4}';
+const G_MORE: char = '\u{E712}';
+const G_PREVIEW: char = '\u{E7B3}';
+const G_REFRESH: char = '\u{E72C}';
+const G_STATUS: char = '\u{E9D9}';
+const G_SPEED: char = '\u{EC4A}';
+const G_KEYBOARD: char = '\u{E765}';
+const G_REVEAL: char = '\u{E8DA}';
+const G_COPY: char = '\u{E8C8}';
+const G_ADMIN: char = '\u{E7EF}';
+const G_TERMINAL: char = '\u{E756}';
+const G_LIST: char = '\u{E8FD}';
+const G_DOWNLOAD: char = '\u{E896}';
+const G_CHEVRON: char = '\u{E76C}';
 
 #[derive(Clone)]
 enum Action {
@@ -74,6 +105,32 @@ impl Action {
             _ => None,
         }
     }
+
+    /// What Enter does, shown on the selected row.
+    fn verb(&self) -> Option<&'static str> {
+        Some(match self {
+            Action::Open(target) if target.starts_with("https://www.google.com/search") || target.contains("/mail/0/search") => "Search",
+            Action::Open(_) | Action::Terminal(_) => "Open",
+            Action::Copy(_) => "Copy",
+            Action::Quit => "Quit",
+            Action::ToggleStartup => "Change",
+            Action::System(command) if command.note == "Windows" => "Run",
+            Action::System(_) => "Open",
+            Action::Query(query) if query.starts_with('/') => "Open",
+            Action::Query(_) => "Try",
+            Action::Switch(_) => "Switch",
+            Action::Reveal(_) => "Reveal",
+            Action::Admin(_) => "Run",
+            Action::Pin(_) => "Pin",
+            Action::Unpin(_) => "Unpin",
+            Action::BeginAlias(_) => "Choose",
+            Action::SetAlias(..) => "Save",
+            Action::RemoveAlias(_) => "Remove",
+            Action::Preview(..) => "Preview",
+            Action::Reindex => "Refresh",
+            Action::Noop => return None,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -90,6 +147,59 @@ struct Item {
     complete: Option<String>, // what Tab puts in the bar
     history_key: Option<String>,
     saved: Option<crate::library::Saved>,
+    header: Option<&'static str>, // a group title drawn above this row
+    answer: bool,                 // a calculation, shown large
+}
+
+impl Item {
+    fn height(&self) -> f32 {
+        ROW_H + if self.header.is_some() { HEADER_H } else { 0.0 }
+    }
+
+    /// Stands in for the shell icon until it loads.
+    fn placeholder(&self) -> char {
+        match self.saved.as_ref().map(|saved| saved.kind) {
+            Some(Kind::Folder) => G_FOLDER,
+            Some(Kind::App) => G_APP,
+            Some(Kind::Email) => G_MAIL,
+            _ => G_FILE,
+        }
+    }
+}
+
+/// Row positions in a list whose group headers make some rows taller.
+struct Rows {
+    offsets: Vec<f32>,
+}
+
+impl Rows {
+    fn new(items: &[Item]) -> Self {
+        let mut offsets = Vec::with_capacity(items.len() + 1);
+        let mut y = 0.0;
+        offsets.push(y);
+        for item in items {
+            y += item.height();
+            offsets.push(y);
+        }
+        Self { offsets }
+    }
+
+    fn total(&self) -> f32 {
+        self.offsets.last().copied().unwrap_or(0.0)
+    }
+
+    fn top(&self, i: usize) -> f32 {
+        self.offsets[i]
+    }
+
+    fn bottom(&self, i: usize) -> f32 {
+        self.offsets[i + 1]
+    }
+
+    /// The row at content height `y`.
+    fn at(&self, y: f32) -> usize {
+        self.offsets.partition_point(|&top| top <= y).saturating_sub(1).min(self.offsets.len().saturating_sub(2))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +263,17 @@ pub struct Lumen {
     settings_folders: String,
     settings_exclusions: String,
     settings_error: String,
+    settings_appearance: Appearance,
     perf_rows: Vec<(String, String)>,
+    appearance: Appearance,
+    windows_light: bool,
+    accent: theme::Accent,
+    visuals_for: Option<Palette>,
+    motion: bool,
+    opened_at: Option<f64>,
+    slide: Slide,
+    snap_slide: bool,
+    keyboard: bool, // the keyboard, not the pointer, moved focus last: show focus outlines
 }
 
 impl Lumen {
@@ -165,7 +285,12 @@ impl Lumen {
         }
         let ctx = cc.egui_ctx.clone();
         let _ = win::CTX.set(ctx.clone());
-        setup_style(&ctx);
+        theme::install_fonts(&ctx);
+        // Lumen chooses light or dark itself; keep egui from switching styles under it.
+        ctx.set_theme(egui::Theme::Light);
+        let appearance = Appearance::load();
+        let windows_light = win::apps_use_light_theme();
+        let accent = win::accent_ramp().map(theme::Accent::from_ramp).unwrap_or_default();
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         }
@@ -350,12 +475,36 @@ impl Lumen {
             settings_folders: String::new(),
             settings_exclusions: String::new(),
             settings_error: String::new(),
+            settings_appearance: appearance,
             perf_rows: Vec::new(),
+            appearance,
+            windows_light,
+            accent,
+            visuals_for: None,
+            motion: win::animations_enabled(),
+            opened_at: None,
+            slide: Slide::default(),
+            snap_slide: true,
+            keyboard: false,
         }
     }
 
     fn query_id() -> Id {
         Id::unique("lumen-query")
+    }
+
+    /// Settings preview their theme before it is saved.
+    fn palette(&self) -> Palette {
+        let appearance = if is_settings(&self.query) { self.settings_appearance } else { self.appearance };
+        Palette::new(appearance.is_dark(self.windows_light), self.accent)
+    }
+
+    /// How far the room has dimmed since Lumen opened, eased, from 0 to 1.
+    fn opening(&self, now: f64) -> f32 {
+        match self.opened_at {
+            Some(start) if self.motion => theme::ease_out(((now - start) / OPEN_TIME) as f32),
+            _ => 1.0,
+        }
     }
 
     /// (caret is at the end, text is selected)
@@ -433,6 +582,7 @@ impl Lumen {
             self.selection_by_user = false;
             self.scroll_offset = 0.0;
             self.scroll_to_selected = true;
+            self.snap_slide = true;
             self.cancel_actions(); // Editing away and back must not revive an earlier Enter.
             crate::metrics::query(&self.query);
         }
@@ -467,8 +617,10 @@ impl Lumen {
             return;
         }
 
-        if let Some(answer) = crate::convert::units(&t).or_else(|| crate::convert::date(&t)) {
-            self.results.push(answer_item(answer));
+        if let Some(answer) = crate::convert::units(&t) {
+            self.results.push(answer_item(answer, G_CONVERT, "Conversion"));
+        } else if let Some(answer) = crate::convert::date(&t) {
+            self.results.push(answer_item(answer, G_CALENDAR, "Date"));
         }
 
         if let Some(v) = calc::eval(&t) {
@@ -486,6 +638,8 @@ impl Lumen {
                 complete: Some(raw),
                 history_key: None,
                 saved: None,
+                header: None,
+                answer: true,
             });
         }
 
@@ -596,6 +750,8 @@ impl Lumen {
             complete: Some(e.name.clone()),
             history_key: Some(e.path.clone()),
             saved: Some(crate::library::Saved::from_entry(e)),
+            header: None,
+            answer: false,
         }
     }
 
@@ -703,6 +859,14 @@ impl Lumen {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            if i.key_pressed(Key::Tab) {
+                self.keyboard = true;
+            }
+            if i.pointer.any_pressed() {
+                self.keyboard = false;
+            }
+        });
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
             self.navigate("/help".into()); return;
         }
@@ -791,158 +955,75 @@ impl Lumen {
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let p = self.palette();
+        let now = ctx.input(|i| i.time);
+        let open = self.opening(now);
         let screen = ui.max_rect();
         let painter = ui.painter().clone();
-        match &self.backdrop {
-            Some(tex) => painter.image(
-                tex.id(),
-                screen,
-                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                Color32::from_gray(win::BACKDROP_BRIGHTNESS),
-            ),
-            None => painter.rect_filled(screen, 0, Color32::from_gray(24)),
-        };
 
         let available_rows = visible_result_rows(screen.height());
-        let settings = self.query.trim().eq_ignore_ascii_case("/settings");
-        let rows = self.results.len().min(available_rows);
+        let settings = is_settings(&self.query);
+        let rows = Rows::new(&self.results);
+        let list_h = rows.total().min(available_rows as f32 * ROW_H);
+        let body_h = |list_h: f32| if list_h > 0.0 { 1.0 + LIST_PAD * 2.0 + list_h + FOOTER_H } else { EMPTY_H };
         let w = WIDTH.min(screen.width() - 40.0);
-        let list_h = |rows: usize| if rows > 0 { 1.0 + LIST_PAD * 2.0 + rows as f32 * ROW_H + FOOTER_H } else { 48.0 };
-        let settings_h = 500.0_f32.min((screen.height() - BAR_H - FILTER_H - 48.0).max(180.0));
-        let h = BAR_H + FILTER_H + if settings { settings_h } else { list_h(rows) };
+        let full_h = BAR_H + FILTER_H + body_h(available_rows as f32 * ROW_H);
+        let h = if settings { full_h } else { BAR_H + FILTER_H + body_h(list_h) };
         // Pin the top where a full list would be centred, so the bar stays still as results change.
-        let full_h = BAR_H + FILTER_H + list_h(available_rows);
-        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, (screen.center().y - full_h / 2.0).min(screen.bottom() - h - 16.0).max(16.0)), vec2(w, h));
+        let top = (screen.center().y - full_h / 2.0).min(screen.bottom() - h - 16.0).max(16.0);
+        let panel = Rect::from_min_size(pos2(screen.center().x - w / 2.0, top), vec2(w, h));
+
+        match &self.backdrop {
+            Some(texture) => {
+                // Pixel for pixel, so the first frame matches the desktop it covers.
+                let area = Rect::from_min_size(screen.min, (texture.size_vec2() / ctx.pixels_per_point()).min(screen.size()));
+                paint::backdrop(&painter, texture.id(), area, panel, &p, open);
+            }
+            None => {
+                painter.rect_filled(screen, 0, Color32::from_gray(24));
+            }
+        }
 
         // Click on the dimmed area closes.
         if ui.interact(screen, Id::unique("dim"), Sense::click()).clicked()
-            && !ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| panel.contains(p))
+            && !ctx.input(|i| i.pointer.interact_pos()).is_some_and(|pos| panel.contains(pos))
         {
             self.hide();
             return;
         }
 
-        // Glow: stacked white layers, from a wide aura that lifts the backdrop to a hot rim at the edge.
-        let r = CornerRadius::same(RADIUS);
-        for (blur, spread, alpha) in [(255, 64, 72), (160, 28, 140), (64, 10, 220), (18, 3, 255)] {
-            painter.add(Shadow { offset: [0, 0], blur, spread, color: Color32::from_white_alpha(alpha) }.as_shape(panel, r));
-        }
-        painter.rect_filled(panel, r, Color32::WHITE);
-
-        // Search bar
+        paint::panel(&painter, panel, &p, open);
         let bar = Rect::from_min_size(panel.min, vec2(w, BAR_H));
-        painter.text(pos2(bar.left() + 36.0, bar.center().y), Align2::CENTER_CENTER, G_SEARCH, icon_font(22.0), SUBTLE);
-        let text_rect = Rect::from_min_max(pos2(bar.left() + TEXT_INSET, bar.top()), pos2(bar.right() - 24.0, bar.bottom()));
-        let font = FontId::proportional(SEARCH_SIZE);
-        let output = ui
-            .scope_builder(UiBuilder::new().max_rect(text_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                TextEdit::singleline(&mut self.query)
-                    .id(Self::query_id())
-                    .frame(egui::Frame::NONE)
-                    .margin(Margin::ZERO)
-                    .font(font.clone())
-                    .text_color(TEXT)
-                    .hint_text(RichText::new("Search, or type / for commands").font(font.clone()).color(HINT))
-                    .desired_width(text_rect.width())
-                    .lock_focus(!settings)
-                    .show(ui)
-            })
-            .inner;
-        if !settings && !output.response.has_focus() {
-            output.response.request_focus();
-        }
-
-        // Inline autocomplete: grey remainder of the selected result after the caret.
-        let (at_end, has_selection) = self.caret(&ctx);
-        self.ghost_shown = false;
-        if at_end
-            && !has_selection
-            && let Some(rest) = self.completion()
-        {
-            let pos = output.galley_pos + vec2(output.galley.size().x, 0.0);
-            painter.with_clip_rect(text_rect).text(pos, Align2::LEFT_TOP, rest, font, GHOST);
-            self.ghost_shown = true;
-        }
-
-        let filters = Rect::from_min_size(pos2(panel.left() + 18.0, bar.bottom()), vec2(w - 36.0, FILTER_H));
-        ui.scope_builder(UiBuilder::new().max_rect(filters).layout(Layout::left_to_right(Align::Center)), |ui| {
-            if self.query.trim_start().starts_with('/') {
-                ui.label(RichText::new("Commands").size(16.0).color(SUBTLE));
-                if ui.link(RichText::new("Back to search").size(14.0)).clicked() { self.navigate(self.return_query.clone()); }
-            } else {
-            for (label, prefix) in [("All", ""), ("Spreadsheets", "excel "), ("Outlook", "mail ")] {
-                let active = if prefix.is_empty() {
-                    !self.query.starts_with("excel ") && crate::mail::query(&self.query).is_none()
-                } else {
-                    self.query.starts_with(prefix)
-                };
-                if ui.selectable_label(active, RichText::new(label).size(16.0)).clicked() {
-                    let term =
-                        self.query.strip_prefix("excel ").or_else(|| crate::mail::query(&self.query)).unwrap_or(&self.query).to_string();
-                    self.query = format!("{prefix}{term}");
-                    self.set_cursor(&ctx, false);
-                }
-            }
-            }
-            if ui.link(RichText::new("Help").size(14.0)).clicked() { self.navigate("/help".into()); }
-            let status = if self.searching && self.found.is_empty() {
-                Some("Searching…")
-            } else if self.query.trim().is_empty() && self.index.is_building() {
-                Some("Indexing…")
-            } else {
-                None
-            };
-            if let Some(release) = &self.available_update {
-                let response = ui
-                    .with_layout(Layout::right_to_left(Align::Center), |ui| ui.link(RichText::new("Update available").size(14.0)))
-                    .inner
-                    .on_hover_text(format!("Download Lumen {}", release.version));
-                if response.clicked() {
-                    crate::update::open_latest(release);
-                    self.hide();
-                }
-            } else if let Some(status) = status {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(status).size(14.0).color(SUBTLE));
-                });
-            }
-        });
+        self.draw_bar(ui, bar, &p, settings);
+        let filters = Rect::from_min_size(pos2(panel.left(), bar.bottom()), vec2(w, FILTER_H));
+        self.draw_filters(ui, filters, &p);
+        let content = Rect::from_min_max(pos2(panel.left(), filters.bottom()), panel.max);
+        painter.hline(panel.x_range(), content.top(), Stroke::new(1.0, p.line));
         if settings {
-            self.draw_settings(ui, Rect::from_min_max(pos2(panel.left(), bar.bottom() + FILTER_H), panel.max));
+            self.draw_settings(ui, content, &p);
             return;
         }
-        if rows == 0 {
-            painter.text(
-                pos2(panel.left() + TEXT_INSET, panel.bottom() - 24.0),
-                Align2::LEFT_CENTER,
-                "Try excel budget, mail invoice, or /help",
-                FontId::proportional(15.0),
-                SUBTLE,
-            );
+        if self.results.is_empty() {
+            let hint = theme::line("Try excel budget, mail invoice, or /help", theme::text(13.0, 400.0, p.ink2), w - TEXT_X - 20.0);
+            paint::text(&painter, pos2(panel.left() + TEXT_X, content.center().y), Align2::LEFT_CENTER, hint);
             return;
         }
-        painter.hline(panel.x_range(), bar.bottom() + FILTER_H, (1.0, DIVIDER));
 
+        let terms = highlight_terms(&self.query);
+        let n = self.results.len();
         let mut budget = 3; // icon loads per frame
         let mut clicked = None;
-        let list_rect = Rect::from_min_size(
-            pos2(panel.left() + 8.0, bar.bottom() + FILTER_H + 1.0 + LIST_PAD),
-            vec2(w - 16.0, rows as f32 * ROW_H),
-        );
+        let list_rect = Rect::from_min_size(pos2(panel.left() + 8.0, content.top() + 1.0 + LIST_PAD), vec2(w - 16.0, list_h));
+        let overflow = rows.total() > list_h + 0.5;
         let scroll = ui
             .scope_builder(UiBuilder::new().id_salt("results-viewport").max_rect(list_rect).layout(Layout::top_down(Align::Min)), |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                // Reserve room for a draggable scrollbar rather than covering row labels.
-                ui.spacing_mut().scroll = egui::style::ScrollStyle {
-                    bar_width: 8.0,
-                    handle_min_length: 24.0,
-                    dormant_handle_opacity: 0.6,
-                    ..egui::style::ScrollStyle::solid()
-                };
+                ui.spacing_mut().scroll = paint::scrollbar();
                 let mut area = egui::ScrollArea::vertical()
                     .id_salt("lumen-results")
-                    .max_height(list_rect.height())
-                    .scroll_bar_visibility(if self.results.len() > rows {
+                    .max_height(list_h)
+                    .min_scrolled_height(list_h)
+                    .scroll_bar_visibility(if overflow {
                         egui::scroll_area::ScrollBarVisibility::AlwaysVisible
                     } else {
                         egui::scroll_area::ScrollBarVisibility::AlwaysHidden
@@ -953,8 +1034,8 @@ impl Lumen {
                     // A new query or keyboard jump takes over from old scroll inertia.
                     self.suppress_scroll_inertia = true;
                     egui::scroll_area::State::default().store(&ctx, ui.make_persistent_id("lumen-results"));
-                    let top = self.selected as f32 * ROW_H;
-                    let offset = self.scroll_offset.clamp((top + ROW_H - list_rect.height()).max(0.0), top);
+                    let selected = self.selected.min(n - 1);
+                    let offset = self.scroll_offset.clamp((rows.bottom(selected) - list_h).max(0.0), rows.top(selected));
                     area = area.vertical_scroll_offset(offset);
                     self.scroll_to_selected = false;
                 } else if ctx.input(|input| input.events.iter().any(|event| {
@@ -965,11 +1046,27 @@ impl Lumen {
                 if self.suppress_scroll_inertia {
                     ctx.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
                 }
-                let output = area.show_rows(ui, ROW_H, self.results.len(), |ui, visible| {
-                    for i in visible {
-                        if self.draw_result(ui, i, &mut budget) {
+                let output = area.show_viewport(ui, |ui, viewport| {
+                    ui.set_height(rows.total());
+                    let origin = ui.max_rect().min;
+                    let width = ui.max_rect().width();
+                    if self.selected < n {
+                        let animate = self.motion && !std::mem::take(&mut self.snap_slide);
+                        self.slide.set(rows.bottom(self.selected) - ROW_H, now, animate, ROW_H * 1.5);
+                        if self.slide.running(now) {
+                            ctx.request_repaint();
+                        }
+                        let lit = Rect::from_min_size(origin + vec2(0.0, self.slide.at(now)), vec2(width, ROW_H));
+                        paint::selection(ui.painter(), &p, lit);
+                    }
+                    // Only rows in view are drawn.
+                    let mut i = rows.at(viewport.min.y);
+                    while i < n && rows.top(i) < viewport.max.y {
+                        let rect = Rect::from_min_size(origin + vec2(0.0, rows.top(i)), vec2(width, rows.bottom(i) - rows.top(i)));
+                        if self.draw_result(ui, rect, i, &mut budget, &p, &terms) {
                             clicked = Some(i);
                         }
+                        i += 1;
                     }
                 });
                 self.scroll_offset = output.state.clamped_offset().y;
@@ -977,41 +1074,37 @@ impl Lumen {
             })
             .inner;
 
-        // Key hints
-        let mut x = panel.left() + 22.0;
-        let fy = panel.bottom() - FOOTER_H / 2.0;
-        painter.hline(panel.x_range(), panel.bottom() - FOOTER_H, (1.0, DIVIDER));
-        let first = (self.scroll_offset / ROW_H).floor() as usize + 1;
-        let last = ((self.scroll_offset + scroll.inner_rect.height()) / ROW_H).ceil() as usize;
-        let counter = painter.text(
-            pos2(panel.right() - 22.0, fy),
-            Align2::RIGHT_CENTER,
-            format!("{first}–{} of {}", last.min(self.results.len()), self.results.len()),
-            FontId::proportional(14.0),
-            SUBTLE,
-        );
-        let painter = painter.with_clip_rect(Rect::from_min_max(panel.min, pos2(counter.left() - 18.0, panel.bottom())));
-        let hints = if !self.search_note.is_empty() {
-            vec![("", self.search_note.as_str())]
+        // Footer: a note or the visible range on the left, keys on the right.
+        let footer = Rect::from_min_max(pos2(panel.left(), panel.bottom() - FOOTER_H), panel.max);
+        painter.hline(panel.x_range(), footer.top(), Stroke::new(1.0, p.line));
+        let cy = footer.center().y;
+        let command = self.query.trim_start().starts_with('/');
+        let selected = self.results.get(self.selected);
+        let mut keys = vec![("Esc", if command { "Back" } else { "Close" })];
+        if selected.is_some_and(|item| item.complete.is_some()) {
+            keys.push(("Tab", "Complete"));
+        }
+        if !command && selected.is_some_and(|item| item.reveal.is_some()) {
+            keys.push(("Ctrl K", "Actions"));
+        }
+        let mut x = footer.right() - 20.0;
+        for (key, what) in keys {
+            let label = theme::line(what, theme::text(12.0, 400.0, p.ink2), f32::INFINITY);
+            let label = paint::text(&painter, pos2(x, cy), Align2::RIGHT_CENTER, label);
+            x = paint::keycap(&painter, &p, pos2(label.left() - 6.0, cy), Align2::RIGHT_CENTER, key).left() - 16.0;
+        }
+        let note = if !self.search_note.is_empty() {
+            Some(self.search_note.clone())
+        } else if overflow {
+            let first = rows.at(self.scroll_offset) + 1;
+            let last = rows.at(self.scroll_offset + scroll.inner_rect.height() - 0.5) + 1;
+            Some(format!("{first}–{last} of {}", thousands(n)))
         } else {
-            let selected = self.results.get(self.selected);
-            let copy_action = selected.is_some_and(|item| matches!(item.action, Action::Copy(_)));
-            let asks = selected.is_some_and(|item| item.action.confirm().is_some());
-            let mut hints = if selected.is_some_and(|item| matches!(item.action, Action::Noop)) { vec![("↑↓", "Browse")] }
-                else { vec![("Enter", if copy_action { "Copy" } else if asks { "Confirm" } else { "Open" })] };
-            if selected.is_some_and(|item| item.reveal.is_some()) {
-                hints.push(("Ctrl+K", "Actions"));
-            }
-            if selected.is_some_and(|item| item.complete.is_some()) {
-                hints.push(("Tab", "Complete"));
-            }
-            hints.push(("Esc", if self.query.trim_start().starts_with('/') { "Back" } else { "Close" }));
-            hints
+            None
         };
-        for (key, what) in hints {
-            let k = painter.text(pos2(x, fy), Align2::LEFT_CENTER, key, FontId::proportional(14.0), SUBTLE);
-            let d = painter.text(pos2(k.right() + 5.0, fy), Align2::LEFT_CENTER, what, FontId::proportional(14.0), HINT);
-            x = d.right() + 18.0;
+        if let Some(note) = note {
+            let note = theme::line(&note, theme::text(12.0, 400.0, p.ink2), x - panel.left() - 32.0);
+            paint::text(&painter, pos2(panel.left() + 20.0, cy), Align2::LEFT_CENTER, note);
         }
 
         if let Some(i) = clicked {
@@ -1024,43 +1117,219 @@ impl Lumen {
         }
     }
 
-    fn draw_result(&mut self, ui: &mut egui::Ui, i: usize, budget: &mut u32) -> bool {
+    /// The search field, with a glyph for how Lumen reads the query and inline completion.
+    fn draw_bar(&mut self, ui: &mut egui::Ui, bar: Rect, p: &Palette, settings: bool) {
         let ctx = ui.ctx().clone();
-        let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-        resp.clone().on_hover_text(&self.results[i].subtitle);
-        let painter = ui.painter(); // Inherit the scroll area's clipping rectangle.
-        if i == self.selected {
-            painter.rect_filled(row, 10, SELECTED);
-        } else if resp.hovered() {
-            painter.rect_filled(row, 10, HOVER);
+        let painter = ui.painter().clone();
+        let (glyph, special) = mode_glyph(&self.query);
+        paint::mode(&painter, p, pos2(bar.left() + GLYPH_X, bar.center().y), glyph, special);
+
+        let text_rect = Rect::from_min_max(pos2(bar.left() + TEXT_X, bar.top()), pos2(bar.right() - 24.0, bar.bottom()));
+        let palette = *p;
+        let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
+            ui.painter().layout_job(query_job(text.as_str(), &palette))
+        };
+        let hint = LayoutJob::single_section("Search apps, files, and mail".into(), theme::display(SEARCH_SIZE, 400.0, p.ink3));
+        let font = FontId::new(SEARCH_SIZE, FontFamily::Name(theme::DISPLAY.into()));
+        let output = ui
+            .scope_builder(UiBuilder::new().max_rect(text_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+                TextEdit::singleline(&mut self.query)
+                    .id(Self::query_id())
+                    .frame(egui::Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .font(font)
+                    .text_color(p.ink)
+                    .hint_text(hint)
+                    .desired_width(text_rect.width())
+                    .lock_focus(!settings)
+                    .layouter(&mut layouter)
+                    .show(ui)
+            })
+            .inner;
+        if !settings && !output.response.has_focus() {
+            output.response.request_focus();
         }
 
-        let icon_rect = Rect::from_center_size(pos2(row.left() + 28.0, row.center().y), Vec2::splat(32.0));
-        let (glyph, icon) = (self.results[i].glyph, self.results[i].icon.clone());
-        if let Some(g) = glyph {
-            painter.rect_filled(icon_rect, 7, GLYPH_BG);
-            painter.text(icon_rect.center(), Align2::CENTER_CENTER, g, icon_font(18.0), TEXT);
-        } else if let Some((key, path)) = icon
-            && let Some(tex) = self.icon(&ctx, &key, &path, budget)
+        // Inline autocomplete: the rest of the selected result's name after the caret.
+        let (at_end, has_selection) = self.caret(&ctx);
+        self.ghost_shown = false;
+        if at_end
+            && !has_selection
+            && let Some(rest) = self.completion()
         {
-            painter.image(tex.id(), icon_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            let pos = output.galley_pos + vec2(output.galley.size().x, 0.0);
+            let ghost = painter.layout_job(LayoutJob::single_section(rest, theme::display(SEARCH_SIZE, 400.0, p.ghost)));
+            painter.with_clip_rect(text_rect).galley(pos, ghost, p.ghost);
+            self.ghost_shown = true;
+        }
+
+        if self.query.is_empty() {
+            let cy = bar.center().y;
+            let label = theme::line("Commands", theme::text(12.0, 400.0, p.ink3), f32::INFINITY);
+            let label = paint::text(&painter, pos2(bar.right() - 20.0, cy), Align2::RIGHT_CENTER, label);
+            paint::keycap(&painter, p, pos2(label.left() - 6.0, cy), Align2::RIGHT_CENTER, "/");
+        }
+    }
+
+    /// Scopes for a search, or where you are within a command; status on the right.
+    fn draw_filters(&mut self, ui: &mut egui::Ui, row: Rect, p: &Palette) {
+        let painter = ui.painter().clone();
+        let cy = row.center().y;
+        let command = self.query.trim_start().starts_with('/');
+        if command {
+            // Search › Settings, where "Search" goes back.
+            let back = painter.layout_job(theme::line("Search", theme::text(13.0, 500.0, Color32::PLACEHOLDER), f32::INFINITY));
+            let back_rect = Rect::from_min_size(pos2(row.left() + TEXT_X - 8.0, cy - 14.0), vec2(back.size().x + 16.0, 28.0));
+            let response = ui.interact(back_rect, Id::unique("lumen-back"), Sense::click()).on_hover_text("Back to your search (Esc)");
+            if response.hovered() {
+                painter.rect_filled(back_rect, 6, p.hover);
+            }
+            let color = if response.hovered() { p.ink } else { p.ink2 };
+            painter.galley(pos2(back_rect.left() + 8.0, cy - back.size().y / 2.0), back, color);
+            let chevron = painter.text(pos2(back_rect.right() + 4.0, cy), Align2::LEFT_CENTER, G_CHEVRON, theme::icon(10.0), p.ink3);
+            let name = crate::command::parse(&self.query).map(|(name, _)| name).unwrap_or_default();
+            let title = theme::line(command_title(&name), theme::text(13.0, 600.0, p.ink), 360.0);
+            paint::text(&painter, pos2(chevron.right() + 10.0, cy), Align2::LEFT_CENTER, title);
+            if response.clicked() {
+                self.navigate(self.return_query.clone());
+            }
+        } else {
+            let mut x = row.left() + TEXT_X - 10.0;
+            for (label, prefix) in [("All", ""), ("Spreadsheets", "excel "), ("Outlook", "mail ")] {
+                let active = if prefix.is_empty() {
+                    !self.query.starts_with("excel ") && crate::mail::query(&self.query).is_none()
+                } else {
+                    self.query.starts_with(prefix)
+                };
+                let weight = if active { 600.0 } else { 500.0 };
+                let galley = painter.layout_job(theme::line(label, theme::text(13.0, weight, Color32::PLACEHOLDER), f32::INFINITY));
+                let rect = Rect::from_min_size(pos2(x, cy - 14.0), vec2(galley.size().x + 20.0, 28.0));
+                let response = ui.interact(rect, Id::unique(("lumen-scope", label)), Sense::click());
+                if response.hovered() && !active {
+                    painter.rect_filled(rect, 6, p.hover);
+                }
+                let color = if active || response.hovered() { p.ink } else { p.ink2 };
+                painter.galley(pos2(rect.left() + 10.0, cy - galley.size().y / 2.0), galley, color);
+                if active {
+                    painter.rect_filled(Rect::from_center_size(pos2(rect.center().x, row.bottom() - 3.5), vec2(16.0, 3.0)), 1.5, p.accent);
+                }
+                if response.clicked() {
+                    let term =
+                        self.query.strip_prefix("excel ").or_else(|| crate::mail::query(&self.query)).unwrap_or(&self.query).to_string();
+                    self.query = format!("{prefix}{term}");
+                    self.set_cursor(ui.ctx(), false);
+                }
+                x = rect.right() + 4.0;
+            }
+        }
+
+        // The right edge: an update, what Lumen is busy with, or help.
+        let right = pos2(row.right() - 12.0, cy);
+        let status = if self.searching && self.found.is_empty() {
+            Some("Searching…".to_string())
+        } else if self.query.trim().is_empty() && self.index.is_building() {
+            Some(format!("Indexing · {} items", thousands(self.index.stats().0)))
+        } else {
+            None
+        };
+        if let Some(release) = &self.available_update {
+            let galley = painter.layout_job(theme::line("Update available", theme::text(12.5, 600.0, p.accent), f32::INFINITY));
+            let rect = Align2::RIGHT_CENTER.anchor_size(right, vec2(galley.size().x + 38.0, 28.0));
+            let response =
+                ui.interact(rect, Id::unique("lumen-update"), Sense::click()).on_hover_text(format!("Download Lumen {}", release.version));
+            if response.hovered() {
+                painter.rect_filled(rect, 6, p.hover);
+            }
+            painter.text(pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, G_DOWNLOAD, theme::icon(12.0), p.accent);
+            painter.galley(pos2(rect.right() - 8.0 - galley.size().x, cy - galley.size().y / 2.0), galley, p.accent);
+            if response.clicked() {
+                crate::update::open_latest(release);
+                self.hide();
+            }
+        } else if let Some(status) = status {
+            let status = theme::line(&status, theme::text(12.0, 400.0, p.ink3), 260.0);
+            paint::text(&painter, right - vec2(8.0, 0.0), Align2::RIGHT_CENTER, status);
+        } else if !command {
+            let galley = painter.layout_job(theme::line("Help", theme::text(12.0, 400.0, Color32::PLACEHOLDER), f32::INFINITY));
+            let rect = Align2::RIGHT_CENTER.anchor_size(right, vec2(galley.size().x + 52.0, 28.0));
+            let response = ui.interact(rect, Id::unique("lumen-help"), Sense::click());
+            if response.hovered() {
+                painter.rect_filled(rect, 6, p.hover);
+            }
+            let label = pos2(rect.right() - 8.0 - galley.size().x, cy - galley.size().y / 2.0);
+            paint::keycap(&painter, p, pos2(label.x - 6.0, cy), Align2::RIGHT_CENTER, "F1");
+            painter.galley(label, galley, if response.hovered() { p.ink } else { p.ink2 });
+            if response.clicked() {
+                self.navigate("/help".into());
+            }
+        }
+    }
+
+    /// One result: an optional group header, then icon, title and subtitle, and on the
+    /// right its kind or, when selected, what Enter does.
+    fn draw_result(&mut self, ui: &mut egui::Ui, rect: Rect, i: usize, budget: &mut u32, p: &Palette, terms: &[String]) -> bool {
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter().clone(); // Inherit the scroll area's clipping rectangle.
+        let row = Rect::from_min_max(pos2(rect.left(), rect.bottom() - ROW_H), rect.max);
+        if let Some(header) = self.results[i].header {
+            let header = theme::line(header, theme::text(12.0, 600.0, p.ink2), row.width() - 24.0);
+            paint::text(&painter, pos2(row.left() + 12.0, row.top() - 6.0), Align2::LEFT_BOTTOM, header);
+        }
+        let response = ui.interact(row, Id::unique(("lumen-row", i)), Sense::click());
+        let selected = i == self.selected;
+        if !selected && response.hovered() {
+            painter.rect_filled(row, ROW_RADIUS, p.hover);
+        }
+        response.clone().on_hover_text(&self.results[i].subtitle);
+
+        let cy = row.center().y;
+        let icon_center = pos2(row.left() + GLYPH_X - 8.0, cy);
+        let (glyph, icon) = (self.results[i].glyph, self.results[i].icon.clone());
+        if let Some(glyph) = glyph {
+            paint::tile(&painter, p, icon_center, glyph, selected);
+        } else if let Some((key, path)) = icon {
+            match self.icon(&ctx, &key, &path, budget) {
+                Some(texture) => {
+                    let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+                    painter.image(texture.id(), Rect::from_center_size(icon_center, Vec2::splat(32.0)), uv, Color32::WHITE);
+                }
+                None => paint::tile(&painter, p, icon_center, self.results[i].placeholder(), false),
+            }
         }
 
         let item = &self.results[i];
-        let label = painter.text(pos2(row.right() - 14.0, row.center().y), Align2::RIGHT_CENTER, &item.label, FontId::proportional(14.0), HINT);
-        let text_x = row.left() + TEXT_INSET - 8.0;
-        let max_w = label.left() - text_x - 16.0;
-        let title = painter.layout_job(single_line(&item.title, 19.0, TEXT, max_w));
-        let sub = match item.action.confirm() {
-            Some(what) if self.is_armed(&item.title) => {
-                painter.layout_job(single_line(&format!("Press Enter again to {what}"), 15.0, TEXT, max_w))
-            }
-            _ => painter.layout_job(single_line(&item.subtitle, 15.0, SUBTLE, max_w)),
+        let armed = item.action.confirm().is_some() && self.is_armed(&item.title);
+        let mut edge = row.right() - 12.0;
+        if selected && let Some(verb) = item.action.verb() {
+            let key = paint::keycap(&painter, p, pos2(edge, cy), Align2::RIGHT_CENTER, "Enter");
+            let (verb, color) = if armed { ("Confirm", p.danger) } else { (verb, p.ink2) };
+            let verb = theme::line(verb, theme::text(12.0, 500.0, color), 120.0);
+            edge = paint::text(&painter, pos2(key.left() - 8.0, cy), Align2::RIGHT_CENTER, verb).left();
+        } else if item.label == "Enter" || item.label.starts_with("Ctrl+") {
+            // An action's shortcut, drawn as the keys to press.
+            edge = paint::keycap(&painter, p, pos2(edge, cy), Align2::RIGHT_CENTER, &item.label.replace('+', " ")).left();
+        } else if !item.label.is_empty() {
+            let label = theme::line(&item.label, theme::text(12.0, 400.0, p.ink3), 140.0);
+            edge = paint::text(&painter, pos2(edge - 2.0, cy), Align2::RIGHT_CENTER, label).left();
+        }
+        // In search results, mark what is pinned; on the home screen its group already says so.
+        if !self.query.trim().is_empty() && item.saved.as_ref().is_some_and(|saved| self.library.pinned(&saved.path)) {
+            edge = painter.text(pos2(edge - 8.0, cy), Align2::RIGHT_CENTER, G_PIN, theme::icon(12.0), p.ink3).left();
+        }
+
+        let text_x = row.left() + TEXT_X - 8.0;
+        let max_w = edge - text_x - 16.0;
+        let title = painter.layout_job(title_job(item, terms, p, max_w));
+        let subtitle = match item.action.confirm() {
+            Some(what) if armed => theme::line(&format!("Press Enter again to {what}"), theme::text(13.0, 500.0, p.danger), max_w),
+            _ => theme::line(&item.subtitle, theme::text(13.0, 400.0, p.ink2), max_w),
         };
-        let top = row.center().y - (title.size().y + 3.0 + sub.size().y) / 2.0;
-        painter.galley(pos2(text_x, top), title.clone(), TEXT);
-        painter.galley(pos2(text_x, top + title.size().y + 3.0), sub, SUBTLE);
-        resp.clicked()
+        let subtitle = painter.layout_job(subtitle);
+        let top = (cy - (title.size().y + subtitle.size().y) / 2.0).round();
+        let gap = title.size().y;
+        painter.galley(pos2(text_x, top), title, p.ink);
+        painter.galley(pos2(text_x, top + gap), subtitle, p.ink2);
+        response.clicked()
     }
 }
 
@@ -1081,7 +1350,14 @@ impl eframe::App for Lumen {
         if just_shown {
             let _ = self.update_opened.send(());
             if self.query.trim().eq_ignore_ascii_case("/perf") { self.perf_rows = crate::metrics::snapshot(); }
-            self.backdrop = self.display_overlay.open().map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
+            // Windows' mode, accent and animation setting may have changed while Lumen was hidden.
+            self.windows_light = win::apps_use_light_theme();
+            self.accent = win::accent_ramp().map(theme::Accent::from_ramp).unwrap_or_default();
+            self.motion = win::animations_enabled();
+            self.opened_at = Some(ctx.input(|i| i.time));
+            let dim = if self.motion { 1.0 } else { self.palette().dim_far };
+            self.backdrop =
+                self.display_overlay.open(brightness(dim)).map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
             if !win::VISIBLE.load(Ordering::Relaxed) {
                 self.hide();
                 return;
@@ -1101,6 +1377,21 @@ impl eframe::App for Lumen {
         } else {
             // A DPI change can resize the native window after the initial move.
             self.display_overlay.fit();
+        }
+
+        let p = self.palette();
+        if self.visuals_for != Some(p) {
+            ctx.set_visuals(theme::visuals(&p));
+            self.visuals_for = Some(p);
+        }
+        // The room dims as the panel lights up. Painting continues a little longer, so the
+        // first frame after the window moves to its display is never left on screen.
+        if let Some(start) = self.opened_at {
+            let now = ctx.input(|i| i.time);
+            if now - start < OPEN_TIME + 0.25 {
+                self.display_overlay.dim(brightness(1.0 + (p.dim_far - 1.0) * self.opening(now)));
+                ctx.request_repaint();
+            }
         }
 
         while let Ok(update) = self.update_rx.try_recv() {
@@ -1196,20 +1487,170 @@ fn simple(title: &str, subtitle: &str, label: &str, glyph: char, action: Action)
         complete: None,
         history_key: None,
         saved: None,
+        header: None,
+        answer: false,
     }
 }
 
-fn answer_item(answer: crate::convert::Answer) -> Item {
-    let mut item = simple(&answer.display, &answer.note, "Copy answer", G_CALC, Action::Copy(answer.copy.clone()));
-    item.copy = Some(answer.copy.clone()); item.complete = Some(answer.copy); item
+fn answer_item(answer: crate::convert::Answer, glyph: char, label: &str) -> Item {
+    let mut item = simple(&answer.display, &answer.note, label, glyph, Action::Copy(answer.copy.clone()));
+    item.copy = Some(answer.copy.clone());
+    item.complete = Some(answer.copy);
+    item.answer = true;
+    item
 }
 
-fn icon_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("icons".into()))
+fn is_settings(query: &str) -> bool {
+    query.trim().eq_ignore_ascii_case("/settings")
 }
 
-fn single_line(text: &str, size: f32, color: Color32, max_width: f32) -> LayoutJob {
-    let mut job = LayoutJob::single_section(text.to_string(), TextFormat::simple(FontId::proportional(size), color));
+/// Backdrop brightness as a byte.
+fn brightness(level: f32) -> u8 {
+    (level * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The query as typed, with the words Lumen treats specially ("excel ", "/help") in the accent.
+fn query_job(text: &str, p: &Palette) -> LayoutJob {
+    let start = text.len() - text.trim_start().len();
+    let split = if text[start..].starts_with('/') {
+        text[start..].find(char::is_whitespace).map_or(text.len(), |end| start + end)
+    } else {
+        crate::index::split_filter(text).0.len()
+    };
+    let mut job = LayoutJob::default();
+    if split > 0 {
+        job.append(&text[..split], 0.0, theme::display(SEARCH_SIZE, 400.0, p.accent));
+    }
+    job.append(&text[split..], 0.0, theme::display(SEARCH_SIZE, 400.0, p.ink));
+    job
+}
+
+/// How Lumen reads the query, as a glyph (None: the command list), and whether it is a special mode.
+fn mode_glyph(query: &str) -> (Option<char>, bool) {
+    if let Some((name, _)) = crate::command::parse(query) {
+        return (command_glyph(&name), true);
+    }
+    let filter = crate::index::split_filter(query).0.trim().to_ascii_lowercase();
+    if crate::mail::query(query).is_some() {
+        (Some(G_MAIL), true)
+    } else if ["excel", "sheets", "type:excel"].iter().any(|word| filter.starts_with(word)) {
+        (Some(G_SHEET), true)
+    } else if filter.starts_with("type:app") {
+        (Some(G_APP), true)
+    } else {
+        (Some(G_SEARCH), false)
+    }
+}
+
+fn command_glyph(name: &str) -> Option<char> {
+    Some(match name {
+        "help" => G_HELP,
+        "pins" | "pin" => G_PIN,
+        "unpin" => G_UNPIN,
+        "recent" => G_HISTORY,
+        "alias" | "aliases" | "unalias" => G_LINK,
+        "windows" => G_WINDOWS,
+        "actions" => G_MORE,
+        "preview" => G_PREVIEW,
+        "calc" => G_CALC,
+        "convert" => G_CONVERT,
+        "date" => G_CALENDAR,
+        "settings" => G_SETTINGS,
+        "reindex" => G_REFRESH,
+        "status" => G_STATUS,
+        "perf" => G_SPEED,
+        _ => return None,
+    })
+}
+
+fn command_title(name: &str) -> &'static str {
+    match name {
+        "help" => "Help",
+        "pins" => "Pins",
+        "pin" => "Pin",
+        "unpin" => "Unpin",
+        "recent" => "Recent",
+        "alias" => "New alias",
+        "aliases" => "Aliases",
+        "unalias" => "Remove an alias",
+        "windows" => "Open windows",
+        "actions" => "Actions",
+        "preview" => "Preview",
+        "calc" => "Calculator",
+        "convert" => "Convert units",
+        "date" => "Dates",
+        "settings" => "Settings",
+        "reindex" => "Refresh the index",
+        "status" => "Index status",
+        "perf" => "Performance",
+        _ => "Commands",
+    }
+}
+
+/// The words to embolden in titles: what was typed, without scope words such as "excel".
+fn highlight_terms(query: &str) -> Vec<String> {
+    if query.trim_start().starts_with('/') {
+        return Vec::new();
+    }
+    let (_, rest) = crate::index::split_filter(query);
+    rest.split_whitespace().filter(|word| !word.contains(':')).map(str::to_string).collect()
+}
+
+/// Where the typed words appear in a title, preferring the start of a word, as
+/// Windows Search does when it emboldens matches.
+fn match_ranges(title: &str, terms: &[String]) -> Vec<std::ops::Range<usize>> {
+    let find = |term: &str| {
+        let mut first = None;
+        for (i, _) in title.char_indices() {
+            if !title.get(i..i + term.len()).is_some_and(|s| s.eq_ignore_ascii_case(term)) {
+                continue;
+            }
+            if title[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric()) {
+                return Some(i..i + term.len());
+            }
+            first.get_or_insert(i..i + term.len());
+        }
+        first
+    };
+    let mut ranges: Vec<_> = terms.iter().filter(|term| !term.is_empty()).filter_map(|term| find(term)).collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+fn title_job(item: &Item, terms: &[String], p: &Palette, max_width: f32) -> LayoutJob {
+    let (size, weight) = if item.answer { (20.0, 500.0) } else { (15.0, 450.0) };
+    let ranges = if item.answer { Vec::new() } else { match_ranges(&item.title, terms) };
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for range in ranges {
+        if range.start > at {
+            job.append(&item.title[at..range.start], 0.0, theme::text(size, weight, p.ink));
+        }
+        job.append(&item.title[range.clone()], 0.0, theme::text(size, 650.0, p.ink));
+        at = range.end;
+    }
+    if at < item.title.len() || job.sections.is_empty() {
+        job.append(&item.title[at..], 0.0, theme::text(size, weight, p.ink));
+    }
     job.wrap = TextWrapping::truncate_at_width(max_width.max(10.0));
     job
 }
@@ -1222,45 +1663,6 @@ fn url_encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
-}
-
-fn setup_style(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    let mut add = |name: &str, file: &str| -> bool {
-        match std::fs::read(format!(r"C:\Windows\Fonts\{file}")) {
-            Ok(bytes) => {
-                fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
-                true
-            }
-            Err(_) => false,
-        }
-    };
-    let segoe = add("segoe", "segoeui.ttf");
-    let icons = add("icons", "SegoeIcons.ttf") || add("icons", "segmdl2.ttf");
-    // Fallbacks for Chinese, Japanese and Korean names; Segoe UI has no CJK glyphs.
-    let fallbacks: Vec<&str> = [("yahei", "msyh.ttc"), ("malgun", "malgun.ttf")]
-        .into_iter()
-        .filter(|(name, file)| add(name, file))
-        .map(|(name, _)| name)
-        .collect();
-    let proportional = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
-    if segoe {
-        proportional.insert(0, "segoe".into());
-    }
-    proportional.extend(fallbacks.iter().map(|name| name.to_string()));
-    let mut icon_family = proportional.clone();
-    if icons {
-        icon_family.insert(0, "icons".into());
-    }
-    fonts.families.insert(FontFamily::Name("icons".into()), icon_family);
-    ctx.set_fonts(fonts);
-
-    let mut visuals = egui::Visuals::light();
-    visuals.selection.bg_fill = Color32::from_rgb(0xC9, 0xDA, 0xF8);
-    visuals.selection.stroke.color = TEXT;
-    visuals.text_cursor.stroke = (2.0, TEXT).into();
-    visuals.panel_fill = Color32::TRANSPARENT;
-    ctx.set_visuals(visuals);
 }
 
 #[cfg(test)]
@@ -1349,7 +1751,17 @@ mod tests {
             settings_folders: String::new(),
             settings_exclusions: String::new(),
             settings_error: String::new(),
+            settings_appearance: Appearance::Light,
             perf_rows: Vec::new(),
+            appearance: Appearance::Light,
+            windows_light: true,
+            accent: theme::Accent::default(),
+            visuals_for: None,
+            motion: false,
+            opened_at: None,
+            slide: Slide::default(),
+            snap_slide: true,
+            keyboard: false,
         }
     }
 
@@ -1441,8 +1853,10 @@ mod tests {
 
     fn ui_context() -> egui::Context {
         let ctx = egui::Context::default();
-        let mut fonts = FontDefinitions::default();
-        fonts.families.insert(FontFamily::Name("icons".into()), fonts.families[&FontFamily::Proportional].clone());
+        let mut fonts = egui::FontDefinitions::default();
+        for family in [theme::ICONS, theme::STRONG, theme::DISPLAY] {
+            fonts.families.insert(FontFamily::Name(family.into()), fonts.families[&FontFamily::Proportional].clone());
+        }
         ctx.set_fonts(fonts);
         ctx
     }
@@ -1557,7 +1971,7 @@ mod tests {
             assert!(app.scroll_offset > 0.0);
             ui_frame(&mut app, &ctx, height, vec![key(Key::End, Modifiers::CTRL)]);
             assert_eq!(app.selected, 100);
-            assert!(app.scroll_offset >= (101 - visible_result_rows(height)) as f32 * ROW_H - 1.0);
+            assert!(app.scroll_offset >= (101 - visible_result_rows(height)) as f32 * ROW_H - 1.0, "height {height}: offset {}", app.scroll_offset);
             ui_frame(&mut app, &ctx, height, vec![key(Key::PageUp, Modifiers::NONE)]);
             assert_eq!(app.selected, 100 - visible_result_rows(height));
             ui_frame(&mut app, &ctx, height, vec![key(Key::Home, Modifiers::CTRL)]);
@@ -1689,5 +2103,71 @@ mod tests {
             assert!(app.pending.is_none(), "a stale activation must be cancelled at execution");
             assert!(!app.is_armed("Restart"), "a dismissed session cannot grant new confirmation");
         }
+    }
+
+    #[test]
+    fn matches_embolden_word_starts_first_and_never_split_characters() {
+        let terms = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(match_ranges("SEAN_BANK_STATEMENTS", &terms(&["statement"])), vec![10..19]);
+        assert_eq!(match_ranges("StarlingStatement.csv", &terms(&["statement"])), vec![8..17], "mid-word when no word starts with it");
+        assert_eq!(match_ranges("Bank statements", &terms(&["state", "bank", "stat"])), vec![0..4, 5..10], "overlaps merge");
+        assert_eq!(match_ranges("Café budget", &terms(&["é", "bud"])), vec![3..5, 6..9]);
+        assert!(match_ranges("budget", &terms(&[""])).is_empty());
+        assert_eq!(highlight_terms("excel ext:xlsx budget q3"), ["budget", "q3"]);
+        assert!(highlight_terms("/help keyboard").is_empty());
+    }
+
+    #[test]
+    fn the_query_shows_scope_words_and_commands_in_the_accent() {
+        let p = Palette::new(false, theme::Accent::default());
+        for (query, token) in [("excel budget", "excel "), ("mail  invoice", "mail  "), ("/help keyboard", "/help"), ("budget", ""), ("", "")] {
+            let job = query_job(query, &p);
+            assert_eq!(job.text, query);
+            let accented: String =
+                job.sections.iter().filter(|s| s.format.color == p.accent).map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0]).collect();
+            assert_eq!(accented, token, "{query}");
+        }
+        assert_eq!(mode_glyph("/settings"), (Some(G_SETTINGS), true));
+        assert_eq!(mode_glyph("/"), (None, true));
+        assert_eq!(mode_glyph("excel budget"), (Some(G_SHEET), true));
+        assert_eq!(mode_glyph("budget"), (Some(G_SEARCH), false));
+        assert_eq!(thousands(103_158), "103,158");
+        assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn home_groups_pins_and_recents_under_headers_without_shifting_rows() {
+        let mut app = launcher();
+        let saved = |name: &str| crate::library::Saved { name: name.into(), path: format!(r"C:\Work\{name}"), kind: Kind::Folder };
+        app.library.pins = vec![saved("Invoices"), saved("Budgets")];
+        app.library.recent = vec![saved("Budgets"), saved("Q3"), saved("Q4")];
+        app.query.clear();
+        app.refresh();
+        let headers: Vec<_> = app.results.iter().map(|item| item.header).collect();
+        assert_eq!(headers, [Some("Pinned"), None, Some("Recent"), None], "a pinned recent appears once");
+        let rows = Rows::new(&app.results);
+        assert_eq!(rows.top(1), ROW_H + HEADER_H);
+        assert_eq!(rows.top(2), 2.0 * ROW_H + HEADER_H);
+        assert_eq!(rows.total(), 4.0 * ROW_H + 2.0 * HEADER_H);
+        assert_eq!(rows.at(0.0), 0);
+        assert_eq!(rows.at(rows.top(2) + 1.0), 2);
+        assert_eq!(rows.at(rows.total() + 100.0), 3, "beyond the end is the last row");
+    }
+
+    #[test]
+    fn the_selection_glides_one_row_and_jumps_further() {
+        let mut slide = Slide::default();
+        slide.set(56.0, 10.0, true, 84.0);
+        assert!(slide.running(10.03));
+        let midway = slide.at(10.03);
+        assert!(midway > 0.0 && midway < 56.0, "{midway}");
+        assert_eq!(slide.at(10.2), 56.0);
+        slide.set(560.0, 11.0, true, 84.0);
+        assert_eq!(slide.at(11.0), 560.0, "a long jump moves at once");
+        slide.set(616.0, 12.0, true, 84.0);
+        slide.set(672.0, 12.02, true, 84.0);
+        assert_eq!(slide.at(12.02), 672.0, "a held key moves at once");
+        slide.set(728.0, 13.0, false, 84.0);
+        assert_eq!(slide.at(13.0), 728.0);
     }
 }
