@@ -296,11 +296,30 @@ impl Lumen {
         self.armed.as_ref().is_some_and(|(query, armed)| *query == self.query && armed == title)
     }
 
-    fn hide(&mut self) {
+    fn cancel_actions(&mut self) {
         self.pending = None;
         self.armed = None;
+    }
+
+    fn hide(&mut self) {
+        self.cancel_actions();
         self.display_overlay.close();
         win::hide();
+    }
+
+    /// Observe native visibility before processing search answers or queued input.
+    fn sync_visibility(&mut self) -> Option<bool> {
+        let visible = win::VISIBLE.load(Ordering::Acquire);
+        let just_shown = visible && win::JUST_SHOWN.swap(false, Ordering::Acquire);
+        if !visible || just_shown {
+            // A hide/show can happen entirely between UI frames.
+            self.cancel_actions();
+        }
+        if !visible {
+            self.display_overlay.close();
+            return None;
+        }
+        Some(just_shown)
     }
 
     fn refresh(&mut self) {
@@ -310,7 +329,7 @@ impl Lumen {
             .flatten();
         if !same_query {
             self.selection_by_user = false;
-            self.armed = None; // editing the text, even back to the same words, asks again
+            self.cancel_actions(); // Editing away and back must not revive an earlier Enter.
         }
         self.last_query = Some(self.query.clone());
         self.last_generation = self.index.generation();
@@ -803,11 +822,8 @@ impl eframe::App for Lumen {
         } else if self.frames == 2 && !win::VISIBLE.load(Ordering::Relaxed) {
             if self.show_at_launch { win::show() } else { win::hide() }
         }
-        if !win::VISIBLE.load(Ordering::Relaxed) {
-            self.display_overlay.close();
-            return;
-        }
-        if win::JUST_SHOWN.swap(false, Ordering::Acquire) {
+        let Some(just_shown) = self.sync_visibility() else { return };
+        if just_shown {
             let _ = self.update_opened.send(());
             self.backdrop = self.display_overlay.open().map(|img| ctx.load_texture("backdrop", img, TextureOptions::LINEAR));
             if !win::VISIBLE.load(Ordering::Relaxed) {
@@ -967,4 +983,108 @@ fn setup_style(ctx: &egui::Context) {
     visuals.text_cursor.stroke = (2.0, TEXT).into();
     visuals.panel_fill = Color32::TRANSPARENT;
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static WINDOW_STATE: Mutex<()> = Mutex::new(());
+
+    struct RestoreVisibility(bool, bool);
+
+    impl Drop for RestoreVisibility {
+        fn drop(&mut self) {
+            win::VISIBLE.store(self.0, Ordering::Relaxed);
+            win::JUST_SHOWN.store(self.1, Ordering::Release);
+        }
+    }
+
+    fn visible_window() -> RestoreVisibility {
+        RestoreVisibility(win::VISIBLE.swap(true, Ordering::Relaxed), win::JUST_SHOWN.swap(false, Ordering::Acquire))
+    }
+
+    /// The UI state with inert channels, without creating native windows or workers.
+    fn launcher() -> Lumen {
+        let (icon_tx, _) = mpsc::channel();
+        let (_, icon_rx) = mpsc::channel();
+        let (_, update_rx) = mpsc::channel();
+        let (update_opened, _) = mpsc::channel();
+        let (search_tx, _) = mpsc::channel();
+        let (_, search_rx) = mpsc::channel();
+        Lumen {
+            query: "restart".into(),
+            last_query: Some("restart".into()),
+            last_generation: 0,
+            results: Vec::new(),
+            selected: 0,
+            selection_by_user: false,
+            index: Arc::new(Index::default()),
+            history: win::History::default(),
+            icons: HashMap::new(),
+            icon_tx,
+            icon_rx,
+            pending_icons: HashSet::new(),
+            seen_focus: true,
+            ghost_shown: false,
+            show_at_launch: false,
+            profile: String::new(),
+            backdrop: None,
+            display_overlay: win::DisplayOverlay::default(),
+            update_rx,
+            update_opened,
+            available_update: None,
+            pinned: false,
+            frames: 2,
+            search_tx,
+            search_rx,
+            search_key: Some(("restart".into(), 0)),
+            found: Vec::new(),
+            searching: true,
+            search_note: String::new(),
+            latest_query: Arc::new(Mutex::new("restart".into())),
+            pending: Some(("restart".into(), Mode::Open)),
+            armed: Some(("restart".into(), "Restart".into())),
+        }
+    }
+
+    #[test]
+    fn hotkey_dismissal_cancels_queued_activation_and_confirmation() {
+        let _lock = WINDOW_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = visible_window();
+        let mut app = launcher();
+        assert!(app.is_armed("Restart"));
+
+        win::toggle(); // The real callback used by the Win+Space hook.
+        assert_eq!(app.sync_visibility(), None);
+        assert!(app.pending.is_none(), "dismissed Enter must not execute when results arrive");
+        assert!(!app.is_armed("Restart"), "dismissal must require fresh confirmation");
+    }
+
+    #[test]
+    fn reopening_between_frames_starts_without_old_activation_or_consent() {
+        let _lock = WINDOW_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = visible_window();
+        let mut app = launcher();
+
+        win::toggle();
+        win::toggle(); // Hide and reopen before the UI observes the hidden state.
+        assert_eq!(app.sync_visibility(), Some(true));
+        assert!(app.pending.is_none(), "reopening must not revive a queued Enter");
+        assert!(!app.is_armed("Restart"), "confirmation belongs to the previous session");
+    }
+
+    #[test]
+    fn editing_away_and_back_does_not_revive_a_queued_activation() {
+        let mut app = launcher();
+        app.query = "budget".into();
+        app.refresh();
+        assert!(app.pending.is_none(), "editing cancels intent even before the replacement search completes");
+        assert!(app.armed.is_none());
+
+        app.query = "restart".into();
+        app.refresh();
+        assert!(app.pending.is_none());
+        assert!(!app.is_armed("Restart"));
+    }
 }

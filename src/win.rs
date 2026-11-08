@@ -83,8 +83,8 @@ pub fn show() {
     // creation to the UI thread so they cannot delay the keyboard hook.
     let monitor = unsafe { active_monitor() };
     TARGET_MONITOR.store(monitor.0 as isize, Ordering::Relaxed);
-    VISIBLE.store(true, Ordering::Relaxed);
     JUST_SHOWN.store(true, Ordering::Release);
+    VISIBLE.store(true, Ordering::Release);
     if let Some(ctx) = CTX.get() {
         ctx.request_repaint();
     }
@@ -349,7 +349,7 @@ pub fn load_icon(path: &str) -> Option<eframe::egui::ColorImage> {
 
 /// Launch counts, so things you open often rank higher, and the result last
 /// opened for each typed query, so that query brings it back first.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct History {
     counts: HashMap<String, u32>,
     picks: HashMap<String, String>, // normalized typed query -> path

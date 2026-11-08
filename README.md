@@ -56,7 +56,9 @@ index about a fifth of its size.
 Each keystroke searches the whole index at once, split across every CPU core; on
 a profile of about 115,000 files and 32 MB of workbook text, a search takes 2–6 ms.
 The previous results stay on screen until the new ones arrive, and Enter pressed
-before they arrive opens the top new result. Mail searches wait for typing to pause.
+before they arrive opens the top new result. Closing Lumen or changing the query
+cancels that queued Enter; closing also resets power-command confirmation.
+Mail searches wait for typing to pause.
 Obsolete mail searches are cancelled; old responses cannot replace newer queries.
 Applications appear before the file scan completes. Files become searchable before
 workbook content finishes indexing.
@@ -74,9 +76,11 @@ match by filename; content indexing does not download them.
 
 Documents, Desktop, Downloads and OneDrive are watched: files created, renamed,
 moved or deleted there show up in search, or leave it, within about a second.
-A saved workbook's text is read again straight away. During the 15-minute refresh,
+A saved workbook's text is read again straight away, including when a save edits
+the existing file in place. During the 15-minute refresh,
 search keeps using the previous index, and text from workbooks whose size, date
-and attributes have not changed is reused rather than read again.
+and attributes have not changed is reused rather than read again. Temporary read
+failures are retried on later refreshes.
 
 XLSX, XLS, XLSM, XLSB and ODS contents are read with Calamine; CSV/TSV text is also
 indexed. Each distinct word is kept once per file, so repeated labels and values

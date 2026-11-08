@@ -37,7 +37,7 @@ pub struct Entry {
     content: String,
     pub detail: String,
     stamp: (u64, u64, u32), // size, last write and attributes when scanned
-    read: bool,             // `content` reflects the file as of `stamp`
+    read: bool,             // reusable at `stamp`; transient extraction failures stay unread
     penalty: u16,           // rank points taken off results seldom wanted
 }
 
@@ -169,6 +169,7 @@ impl Changes {
 /// What a folder watch reports.
 pub enum Change {
     Added(PathBuf),
+    Modified(PathBuf),
     Removed(PathBuf),
 }
 
@@ -286,14 +287,15 @@ impl Index {
         // Read the disk first; the overlay is locked only to record the result.
         let mut found: Vec<Result<Entry, String>> = Vec::new();
         for change in changes {
+            let is_addition = matches!(&change, Change::Added(_));
             match change {
                 Change::Removed(path) => found.push(Err(path.to_string_lossy().to_lowercase())),
-                Change::Added(path) => {
+                Change::Added(path) | Change::Modified(path) => {
                     let Some(depth) = watched_depth(root, &path) else { continue };
                     let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
                     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     let Some(e) = scanned_entry(name, &path, &md, depth) else { continue };
-                    let walk_in = e.kind == Kind::Folder && descends(&e, &md);
+                    let walk_in = is_addition && e.kind == Kind::Folder && descends(&e, &md);
                     found.push(Ok(e));
                     // A folder moved or renamed in brings its contents.
                     if walk_in {
@@ -317,7 +319,7 @@ impl Index {
         if unread.is_empty() {
             return;
         }
-        // Saving a workbook replaces the file, so read the new text rather than lose it.
+        // A save can replace or modify the file; read its current text in either case.
         let read: Vec<Entry> = unread
             .into_iter()
             .map(|mut e| {
@@ -338,14 +340,19 @@ impl Index {
 
     /// The indexed entry with this exact path.
     pub fn get(&self, path: &str) -> Option<Entry> {
-        if let Some(e) = self.changes.read().unwrap().added.iter().find(|e| e.path == path) {
+        let location = path.to_lowercase();
+        let changes = self.changes.read().unwrap().clone();
+        if let Some(e) = changes.added.iter().find(|e| e.location == location) {
             return Some(e.clone());
+        }
+        if changes.hides(&location) {
+            return None;
         }
         let entries = self.entries.read().unwrap().clone();
-        if let Some(e) = entries.iter().find(|e| e.path == path) {
+        if let Some(e) = entries.iter().find(|e| e.location == location) {
             return Some(e.clone());
         }
-        self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.path == path).cloned())
+        self.mapped.read().unwrap().values().find_map(|entries| entries.iter().find(|e| e.location == location).cloned())
     }
 
     pub fn search(&self, query: &str, max: usize, uses: impl Fn(&str) -> u32 + Sync) -> Vec<Entry> {
@@ -666,8 +673,9 @@ fn needs_reading(lower_name: &str) -> bool {
 
 // Never hydrate cloud placeholders while building the local content index.
 fn enrich(e: &mut Entry) {
-    e.read = true;
+    e.read = false;
     if e.kind != Kind::File || !needs_reading(&e.lower) {
+        e.read = true;
         return;
     }
     let ext = extension(&e.lower);
@@ -675,6 +683,7 @@ fn enrich(e: &mut Entry) {
         return;
     };
     if md.len() > 16 * 1024 * 1024 || md.file_attributes() & (0x1000 | 0x40000 | 0x400000) != 0 {
+        e.read = true; // Deliberately skipped; a changed stamp makes it eligible again.
         return;
     }
     if matches!(ext, "csv" | "tsv" | "eml") {
@@ -686,6 +695,7 @@ fn enrich(e: &mut Entry) {
                 words.add(&String::from_utf8_lossy(&bytes).to_lowercase());
                 e.content = words.text;
                 e.detail = if ext == "eml" { "Saved email · text searchable" } else { "Cell text searchable" }.into();
+                e.read = true;
             }
         }
         return;
@@ -694,6 +704,7 @@ fn enrich(e: &mut Entry) {
         let names = book.sheet_names();
         e.detail = format!("Sheets: {}", names.join(", "));
         let mut words = Words::default();
+        let mut complete = true;
         words.add(&names.join(" ").to_lowercase());
         for name in names.iter().take(32) {
             if words.full() {
@@ -706,9 +717,12 @@ fn enrich(e: &mut Entry) {
                     }
                     words.add(&cell.to_string().to_lowercase().chars().take(512).collect::<String>());
                 }
+            } else {
+                complete = false;
             }
         }
         e.content = words.text;
+        e.read = complete;
     }
 }
 
@@ -992,6 +1006,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_lookup_does_not_resurrect_deleted_files_or_folders() {
+        let root = Path::new(r"C:\Lumen lookup regression");
+        let deleted = root.join("old plan.txt");
+        let folder = root.join("Reports");
+        let nested = folder.join("forecast.xlsx");
+        let index = Index::default();
+        *index.entries.write().unwrap() = Arc::new(vec![
+            Entry::new("old plan.txt".into(), deleted.to_string_lossy().into_owned(), Kind::File, 1),
+            Entry::new("forecast.xlsx".into(), nested.to_string_lossy().into_owned(), Kind::File, 2),
+        ]);
+        let mapped = r"W:\Accounts\budget.xlsx";
+        index.mapped.write().unwrap().insert("W:\\".into(), Arc::new(vec![Entry::new("budget.xlsx".into(), mapped.into(), Kind::File, 2)]));
+
+        assert!(index.get(&deleted.to_string_lossy()).is_some());
+        assert!(index.get(&nested.to_string_lossy()).is_some());
+        assert!(index.get(mapped).is_some());
+        index.apply(
+            root,
+            vec![Change::Removed(deleted.clone()), Change::Removed(folder), Change::Removed(PathBuf::from(r"W:\Accounts"))],
+            &|| (),
+        );
+
+        assert!(index.search("plan", 5, |_| 0).is_empty());
+        assert!(index.get(&deleted.to_string_lossy()).is_none(), "a learned file must stay deleted");
+        assert!(index.get(&nested.to_string_lossy()).is_none(), "deleting a folder also hides its children");
+        assert!(index.get(mapped).is_none(), "mapped snapshots obey the same deletion policy");
+    }
+
+    #[test]
     fn refresh_reuses_text_only_of_unchanged_files() {
         let scanned = |name: &str, stamp| {
             let mut e = Entry::new(name.into(), format!(r"C:\nowhere\{name}"), Kind::File, 1);
@@ -1010,6 +1053,38 @@ mod tests {
         assert_eq!(reuse_content(&mut list, &previous), "cashflow".len());
         assert!(list[0].read && list[0].content == "cashflow");
         assert!(!list[1].read && list[1].content.is_empty(), "edited files are read again");
+    }
+
+    #[test]
+    fn refresh_retries_a_transient_content_read_failure_without_a_file_change() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!("lumen-content-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("forecast.csv");
+        std::fs::write(&path, "projected revenue,42000").unwrap();
+        let scan = || scanned_entry("forecast.csv".into(), &path, &std::fs::metadata(&path).unwrap(), 1).unwrap();
+        let mut previous = scan();
+
+        // A saving application can deny access without changing the file itself.
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        enrich(&mut previous);
+        assert!(previous.content.is_empty(), "the exclusive handle must prevent extraction");
+        drop(locked);
+
+        let mut refreshed = vec![scan()];
+        assert_eq!(previous.stamp, refreshed[0].stamp, "recovery must not depend on a changed stamp");
+        reuse_content(&mut refreshed, &[previous]);
+        for entry in &mut refreshed {
+            if !entry.read {
+                enrich(entry);
+            }
+        }
+        let index = Index::default();
+        *index.entries.write().unwrap() = Arc::new(refreshed);
+        let found = index.search("projected revenue", 5, |_| 0);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(found.len(), 1, "the next refresh must recover text after a temporary lock is released");
     }
 
     #[test]
