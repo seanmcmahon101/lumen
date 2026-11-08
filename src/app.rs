@@ -502,6 +502,11 @@ impl Lumen {
     }
 
     fn execute(&mut self, i: usize, mode: Mode) {
+        // The hook can hide or reopen Lumen after this frame's visibility poll.
+        if !win::VISIBLE.load(Ordering::Acquire) || win::JUST_SHOWN.load(Ordering::Acquire) {
+            self.cancel_actions();
+            return;
+        }
         if i >= self.results.len() {
             return;
         }
@@ -1086,5 +1091,29 @@ mod tests {
         app.refresh();
         assert!(app.pending.is_none());
         assert!(!app.is_armed("Restart"));
+    }
+
+    #[test]
+    fn dismissal_after_visibility_poll_rejects_activation_in_the_same_frame() {
+        let _lock = WINDOW_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = visible_window();
+        for reopen in [false, true] {
+            win::VISIBLE.store(true, Ordering::Release);
+            win::JUST_SHOWN.store(false, Ordering::Release);
+            let mut app = launcher();
+            // An unarmed command only asks for confirmation, even before the fix.
+            app.armed = None;
+            app.results = vec![system_item(crate::system::find("restart").0[0])];
+            assert_eq!(app.sync_visibility(), Some(false));
+
+            win::toggle(); // The hook dismisses while this frame processes results.
+            if reopen {
+                win::toggle();
+            }
+            app.execute(0, Mode::Open);
+
+            assert!(app.pending.is_none(), "a stale activation must be cancelled at execution");
+            assert!(!app.is_armed("Restart"), "a dismissed session cannot grant new confirmation");
+        }
     }
 }

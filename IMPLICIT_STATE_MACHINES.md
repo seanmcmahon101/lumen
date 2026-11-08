@@ -8,12 +8,12 @@ At the audited revision, the source contained **18 runtime workflow families** w
 
 The four priority findings below have been fixed:
 
-- Native hotkey dismissal and reopening cancel deferred activation and command confirmation, including a hide/show between UI frames. Editing the query also cancels deferred activation.
+- Native hotkey dismissal and reopening cancel deferred activation and command confirmation, including a hide/show between UI frames. Activation rechecks visibility before dispatch to reject a dismissal during frame processing. Editing the query also cancels deferred activation.
 - Exact index lookup honors the same replacement and deletion overlay as ordinary search, keeping learned picks from restoring deleted paths.
 - Directory watches subscribe to last-write/size changes and apply modified-file events. Modified folders do not trigger the recursive scan used for newly added folders.
 - Failed content reads remain eligible for the next refresh. Successful reads and deliberate exclusions remain reusable for an unchanged file.
 
-Six regression tests exercise these behaviors, including real Windows notifications and a temporary exclusive file lock. Each failed before its corresponding fix and passed afterward. The full test suite passes with 33 passed and one deliberately ignored profiling test. The inventory and findings below remain a historical snapshot; their source links point to the audited commit.
+Seven regression tests exercise these behaviors, including real Windows notifications and a temporary exclusive file lock. Each failed before its corresponding fix and passed afterward. The full test suite passes with 34 passed and one deliberately ignored profiling test, and the Windows release build passes. The inventory and findings below remain a historical snapshot; their source links point to the audited commit.
 
 Original audit scope: all 11 Rust source files, their embedded PowerShell, existing tests, the installer and release workflow. The initial audit was static: interaction findings came from source, and existing tests were inspected without running the suite at that stage. State names below describe behavior at the audited revision; proposed names and changes are identified as recommendations.
 
