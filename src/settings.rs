@@ -45,6 +45,27 @@ pub struct Settings {
     pub profile: bool,
     pub folders: Vec<String>,
     pub exclusions: Vec<String>,
+    /// Shared folders already added for this user, so one removed in
+    /// preferences is not added again.
+    pub shared_added: Vec<String>,
+}
+
+/// Team folders indexed for everyone whose PC can reach them.
+const SHARED_FOLDERS: [&str; 1] = [r"W:\Accounts\SM\AP INVOICE PROJECT"];
+
+/// Adds each reachable shared folder not added before. Returns whether settings
+/// changed. Call off the UI thread: a mapped drive may answer slowly.
+pub fn add_shared_folders() -> bool {
+    let reachable: Vec<&str> = SHARED_FOLDERS
+        .into_iter()
+        .filter(|f| std::path::Path::new(f).is_dir())
+        .collect();
+    let mut settings = get();
+    let changed = settings.add_shared(&reachable);
+    if changed {
+        set(settings);
+    }
+    changed
 }
 
 impl Default for Settings {
@@ -58,6 +79,7 @@ impl Default for Settings {
             profile: true,
             folders: Vec::new(),
             exclusions: Vec::new(),
+            shared_added: Vec::new(),
         }
     }
 }
@@ -93,6 +115,20 @@ pub fn within(path: &str, folder: &str) -> bool {
 }
 
 impl Settings {
+    fn add_shared(&mut self, reachable: &[&str]) -> bool {
+        let mut changed = false;
+        for folder in reachable {
+            if self.shared_added.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+                continue;
+            }
+            self.shared_added.push((*folder).into());
+            if !self.folders.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+                self.folders.push((*folder).into());
+            }
+            changed = true;
+        }
+        changed
+    }
     pub fn excluded(&self, path: &str) -> bool {
         self.exclusions.iter().any(|f| within(path, f))
     }
@@ -128,6 +164,16 @@ mod tests {
         assert!(within(r"C:\Work\Private\a.xlsx", r"c:\work\private\"));
         assert!(!within(r"C:\Work\PrivateNotes\a.xlsx", r"C:\Work\Private"));
         assert!(within(r"C:\Work", r"C:\Work"));
+    }
+    #[test]
+    fn shared_folder_is_added_once_and_stays_removed() {
+        let mut s = Settings::default();
+        assert!(!s.add_shared(&[]), "an unreachable folder is left for a later launch");
+        assert!(s.add_shared(&[r"W:\Team\Invoices"]));
+        assert_eq!(s.folders, [r"W:\Team\Invoices"]);
+        s.folders.clear();
+        assert!(!s.add_shared(&[r"w:\team\invoices"]));
+        assert!(s.folders.is_empty());
     }
     #[test]
     fn invalid_preferences_keep_existing_state() {

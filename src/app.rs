@@ -340,6 +340,13 @@ impl Lumen {
         index.start(move || repaint.request_repaint());
         let repaint = ctx.clone();
         let watch_tx = crate::watch::spawn(index.clone(), move || repaint.request_repaint());
+        let (shared_index, repaint, shared_watch) = (index.clone(), ctx.clone(), watch_tx.clone());
+        std::thread::spawn(move || {
+            if crate::settings::add_shared_folders() {
+                let _ = shared_watch.send(());
+                shared_index.rebuild(move || repaint.request_repaint());
+            }
+        });
         let (search_tx, requests) = mpsc::channel::<(String, u64, win::History)>();
         let (answers, search_rx) = mpsc::channel();
         let latest_query = Arc::new(Mutex::new(String::new()));
