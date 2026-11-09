@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "0.5.4"
+version = "0.5.5"
 license = "MIT"
 edition = "2024"
 
