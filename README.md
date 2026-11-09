@@ -1,5 +1,8 @@
 # Lumen
 
+<img width="780" height="624" alt="image" src="https://github.com/user-attachments/assets/640bc96f-ce8e-4741-85e5-7a31022f20c6" />
+
+
 A Windows launcher opened with **Win+Space**. Type to find applications, files,
 spreadsheets and Outlook mail. Enter opens, Ctrl+Enter reveals a local file,
 Tab completes, and Escape closes. Click the search filters to switch scope.
