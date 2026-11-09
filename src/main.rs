@@ -57,6 +57,8 @@ fn main() -> eframe::Result {
             .with_inner_size([800.0, 600.0])
             // eframe force-shows the window after its first paint; keep that off-screen.
             .with_position([-32000.0, -32000.0]),
+        // Lumen reads the clipboard itself, so a folder copied in File Explorer pastes as its path.
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native("Lumen", options, Box::new(|cc| Ok(Box::new(app::Lumen::new(cc)))))

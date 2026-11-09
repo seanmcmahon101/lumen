@@ -522,11 +522,19 @@ impl Lumen {
                 } else {
                     Some(argument.trim_matches('"').replace('/', "\\"))
                 };
+                let picker = simple(
+                    if folder.is_some() {
+                        "Choose another folder…"
+                    } else {
+                        "Choose a folder to search…"
+                    },
+                    "Opens the Windows folder picker · or paste a full path after /index",
+                    "",
+                    G_FOLDER,
+                    Action::PickFolder,
+                );
                 let Some(folder) = folder else {
-                    self.info(
-                        "Choose a folder to add",
-                        "Select a folder in the results first, or use /index C:\\Work.",
-                    );
+                    self.results.push(picker);
                     return true;
                 };
                 let settings = crate::settings::get();
@@ -564,6 +572,9 @@ impl Lumen {
                         G_FOLDER,
                         Action::AddFolder(folder),
                     ));
+                }
+                if argument.is_empty() {
+                    self.results.push(picker);
                 }
             }
             "settings" => {}
@@ -713,6 +724,24 @@ impl Lumen {
                 ));
             }
         }
+    }
+
+    pub(super) fn add_folder(&mut self, folder: &str) {
+        // One check on Enter, never while typing; a network drive may answer slowly.
+        if crate::index::local_path(folder) && !std::path::Path::new(folder).is_dir() {
+            self.search_note = format!("{folder} is not a folder on this PC");
+            return;
+        }
+        let mut settings = crate::settings::get();
+        settings.folders.push(folder.into());
+        if let Err(error) = settings.validate() {
+            self.search_note = error.into();
+            return;
+        }
+        crate::settings::set(settings);
+        let _ = self.watch_tx.send(());
+        self.reindex();
+        self.navigate("/status".into());
     }
 
     pub(super) fn reindex(&self) {

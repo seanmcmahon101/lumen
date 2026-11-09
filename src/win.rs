@@ -372,6 +372,37 @@ pub fn copy(text: &str) {
     }
 }
 
+/// Clipboard text, or the paths of files and folders copied in File Explorer,
+/// which put no text on the clipboard.
+pub fn paste_text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    if let Ok(text) = cb.get_text()
+        && !text.is_empty()
+    {
+        return Some(text.replace("\r\n", "\n"));
+    }
+    let files = cb.get().file_list().ok()?;
+    let paths: Vec<_> = files.iter().map(|p| p.to_string_lossy()).collect();
+    Some(paths.join("\n")).filter(|p| !p.is_empty())
+}
+
+/// The Windows folder picker. Blocks until it closes, so call it off the UI thread.
+pub fn pick_folder() -> Option<String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
+    use windows::Win32::UI::Shell::{FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetOptions(dialog.GetOptions().ok()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        dialog.SetTitle(w!("Choose a folder for Lumen to search")).ok()?;
+        dialog.Show(None).ok()?; // an error when the picker is cancelled
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const c_void));
+        path
+    }
+}
+
 /// Shell icon for a file, folder or shell:AppsFolder item, as straight RGBA.
 pub fn load_icon(path: &str) -> Option<eframe::egui::ColorImage> {
     unsafe {

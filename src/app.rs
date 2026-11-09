@@ -94,6 +94,7 @@ enum Action {
     RemoveAlias(String),
     Preview(crate::library::Saved, String),
     AddFolder(String),
+    PickFolder,
     Reindex,
     Noop,
 }
@@ -129,6 +130,7 @@ impl Action {
             Action::RemoveAlias(_) => "Remove",
             Action::Preview(..) => "Preview",
             Action::AddFolder(_) => "Add",
+            Action::PickFolder => "Choose",
             Action::Reindex => "Refresh",
             Action::Noop => return None,
         })
@@ -254,6 +256,8 @@ pub struct Lumen {
     watch_tx: mpsc::Sender<()>,
     preview_tx: mpsc::Sender<crate::preview::Request>,
     preview_rx: mpsc::Receiver<crate::preview::Response>,
+    folder_tx: mpsc::Sender<String>,
+    folder_rx: mpsc::Receiver<String>, // folders chosen in the /index picker
     preview_key: Option<crate::preview::Request>,
     preview_lines: Option<Result<Vec<crate::preview::Line>, String>>,
     preview_terms: String,
@@ -302,6 +306,7 @@ impl Lumen {
         crate::hook::set_hotkey(settings.hotkey);
         let repaint = ctx.clone();
         let (preview_tx, preview_rx) = crate::preview::spawn(move || repaint.request_repaint());
+        let (folder_tx, folder_rx) = mpsc::channel();
         let (window_tx, window_requests) = mpsc::channel();
         let (window_answers, window_rx) = mpsc::channel();
         let repaint = ctx.clone();
@@ -466,6 +471,8 @@ impl Lumen {
             watch_tx,
             preview_tx,
             preview_rx,
+            folder_tx,
+            folder_rx,
             preview_key: None,
             preview_lines: None,
             preview_terms: String::new(),
@@ -812,18 +819,7 @@ impl Lumen {
                 self.command_target = Some(self.saved_item(saved)); self.preview_terms = terms.clone(); self.preview_key = None;
                 self.navigate("/preview".into()); return;
             }
-            Action::AddFolder(folder) => {
-                // One check on Enter, never while typing; a network drive may answer slowly.
-                if crate::index::local_path(folder) && !std::path::Path::new(folder).is_dir() {
-                    self.search_note = format!("{folder} is not a folder on this PC"); return;
-                }
-                let mut settings = crate::settings::get();
-                settings.folders.push(folder.clone());
-                if let Err(error) = settings.validate() { self.search_note = error.into(); return; }
-                crate::settings::set(settings);
-                let _ = self.watch_tx.send(());
-                self.reindex(); self.navigate("/status".into()); return;
-            }
+            Action::AddFolder(folder) => { self.add_folder(folder); return; }
             Action::Reindex => { self.reindex(); self.navigate("/status".into()); return; }
             _ => {}
         }
@@ -838,6 +834,12 @@ impl Lumen {
             (_, _, Action::Reveal(path)) => { win::reveal(path); false }
             (_, _, Action::Admin(path)) => { win::shell_open(path, "runas", None); false }
             (_, _, Action::Terminal(folder)) => { crate::desktop::terminal(folder); false }
+            (_, _, Action::PickFolder) => {
+                // The picker takes focus, so Lumen hides first and reopens with the answer.
+                let tx = self.folder_tx.clone();
+                std::thread::spawn(move || if let Some(folder) = win::pick_folder() { let _ = tx.send(folder); win::show(); });
+                false
+            }
             (_, _, Action::Quit) => crate::tray::quit(),
             (_, _, Action::ToggleStartup) => { win::set_startup(!win::startup_enabled()); false }
             (_, _, Action::System(command)) => { crate::system::run(&command.target); false }
@@ -1352,6 +1354,24 @@ impl eframe::App for Lumen {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    /// Cut, copy and paste, which eframe leaves to Lumen (`clipboard_shortcuts: false`).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let at_end = self.caret(ctx).0;
+        raw_input.events = std::mem::take(&mut raw_input.events)
+            .into_iter()
+            .filter_map(|event| match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => match clipboard_shortcut(key, modifiers) {
+                    Some(egui::Event::Paste(_)) => {
+                        win::paste_text().map(|text| egui::Event::Paste(paste_into(&self.query, at_end, text)))
+                    }
+                    Some(shortcut) => Some(shortcut),
+                    None => Some(event),
+                },
+                event => Some(event),
+            })
+            .collect();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe shows the window after frame 1; put it back to hidden on frame 2.
         self.frames = self.frames.saturating_add(1);
@@ -1418,6 +1438,13 @@ impl eframe::App for Lumen {
         }
         while let Ok((request, lines)) = self.preview_rx.try_recv() {
             self.accept_preview(request, lines);
+        }
+        while let Ok(folder) = self.folder_rx.try_recv() {
+            // Show /index's checks for the chosen folder, and add it when they pass.
+            self.navigate(format!("/index {folder}"));
+            if let Some(Action::AddFolder(folder)) = self.results.first().map(|i| i.action.clone()) {
+                self.add_folder(&folder);
+            }
         }
 
         while let Ok((q, generation, found, note)) = self.search_rx.try_recv() {
@@ -1568,6 +1595,31 @@ fn mode_glyph(query: &str) -> (Option<char>, bool) {
     }
 }
 
+/// The clipboard event a key press stands for, matching egui's own shortcuts.
+fn clipboard_shortcut(key: Key, modifiers: Modifiers) -> Option<egui::Event> {
+    let command = modifiers.command_only();
+    if key == Key::Cut || (command && key == Key::X) || (modifiers.shift && key == Key::Delete) {
+        Some(egui::Event::Cut)
+    } else if key == Key::Copy || (command && key == Key::C) || (modifiers.ctrl && key == Key::Insert) {
+        Some(egui::Event::Copy)
+    } else if key == Key::Paste || (command && key == Key::V) || (modifiers.shift && key == Key::Insert) {
+        Some(egui::Event::Paste(String::new()))
+    } else {
+        None
+    }
+}
+
+/// Pasting straight after a command name, as in "/index" then Ctrl+V, adds the
+/// space that separates the command from its argument.
+fn paste_into(query: &str, at_end: bool, text: String) -> String {
+    let after_command = at_end
+        && !text.starts_with(char::is_whitespace)
+        && query.strip_prefix('/').is_some_and(|name| {
+            crate::command::COMMANDS.iter().any(|c| c.usage.contains(' ') && c.name.eq_ignore_ascii_case(name))
+        });
+    if after_command { format!(" {text}") } else { text }
+}
+
 fn command_glyph(name: &str) -> Option<char> {
     Some(match name {
         "help" => G_HELP,
@@ -1711,6 +1763,7 @@ mod tests {
         let (watch_tx, _) = mpsc::channel();
         let (preview_tx, _) = mpsc::channel();
         let (_, preview_rx) = mpsc::channel();
+        let (folder_tx, folder_rx) = mpsc::channel();
         let (window_tx, _) = mpsc::channel();
         let (_, window_rx) = mpsc::channel();
         Lumen {
@@ -1756,6 +1809,8 @@ mod tests {
             watch_tx,
             preview_tx,
             preview_rx,
+            folder_tx,
+            folder_rx,
             preview_key: None,
             preview_lines: None,
             preview_terms: String::new(),
@@ -1807,8 +1862,9 @@ mod tests {
     #[test]
     fn index_command_offers_only_full_local_or_mapped_folders() {
         let mut app = launcher();
+        app.query = "/index".into(); app.refresh();
+        assert!(matches!(app.results[0].action, Action::PickFolder));
         for (query, title) in [
-            ("/index", "Choose a folder to add"),
             ("/index Work", "Use a full folder path"),
             (r"/index \\server\share", "Use a mapped drive for network folders"),
         ] {
@@ -1817,6 +1873,23 @@ mod tests {
         }
         app.query = r#"/index "Q:/Lumen Test""#.into(); app.refresh();
         assert!(matches!(&app.results[0].action, Action::AddFolder(f) if f == r"Q:\Lumen Test"));
+    }
+
+    #[test]
+    fn paste_after_a_command_name_starts_its_argument() {
+        let paste = |query: &str, at_end| paste_into(query, at_end, r"C:\Work".into());
+        assert_eq!(paste("/index", true), r" C:\Work");
+        assert_eq!(paste("/INDEX", true), r" C:\Work");
+        assert_eq!(paste("/index ", true), r"C:\Work");
+        assert_eq!(paste("/index", false), r"C:\Work");
+        assert_eq!(paste("/status", true), r"C:\Work");
+        assert_eq!(paste("budget", true), r"C:\Work");
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND; // as egui-winit reports Ctrl on Windows
+        assert!(matches!(clipboard_shortcut(Key::V, ctrl), Some(egui::Event::Paste(_))));
+        assert!(matches!(clipboard_shortcut(Key::Insert, Modifiers::SHIFT), Some(egui::Event::Paste(_))));
+        assert!(matches!(clipboard_shortcut(Key::C, ctrl), Some(egui::Event::Copy)));
+        assert!(matches!(clipboard_shortcut(Key::X, ctrl), Some(egui::Event::Cut)));
+        assert!(clipboard_shortcut(Key::K, ctrl).is_none() && clipboard_shortcut(Key::V, Modifiers::NONE).is_none());
     }
 
     #[test]
