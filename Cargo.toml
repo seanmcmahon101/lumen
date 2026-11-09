@@ -1,6 +1,8 @@
 [package]
 name = "lumen"
 version = "0.5.6"
+description = "Fast local search for Windows: apps, files, spreadsheet contents and Outlook mail"
+repository = "https://github.com/seanmcmahon101/lumen"
 license = "MIT"
 edition = "2024"
 
