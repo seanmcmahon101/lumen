@@ -230,9 +230,7 @@ impl Index {
     // recursion limit.
     fn rebuild_impl(self: &Arc<Self>, on_done: Arc<dyn Fn() + Send + Sync + 'static>) {
         let settings = crate::settings::get();
-        let roots = if settings.profile { mapped_roots() } else {
-            settings.folders.iter().filter(|root| !local_path(root)).cloned().collect()
-        };
+        let roots = network_roots(if settings.profile { mapped_roots() } else { Vec::new() }, &settings.folders);
         {
             let mut mapped = self.mapped.write().unwrap(); let previous = mapped.len();
             mapped.retain(|root, _| roots.iter().any(|r| r.eq_ignore_ascii_case(root)));
@@ -243,17 +241,19 @@ impl Index {
         let (network_index, network_done) = (self.clone(), on_done.clone());
         std::thread::spawn(move || {
             if !crate::settings::get().files && !crate::settings::get().excel { return; }
-            for root in roots {
+            for root in roots.clone() {
                 if crate::settings::get().excluded(&root) { continue; }
+                // Folders added inside this root have workers of their own.
+                let nested: Vec<String> = roots.iter().filter(|r| inside(r, &root)).cloned().collect();
                 if !network_index.scanning_drives.lock().unwrap().insert(root.clone()) {
                     continue;
                 }
                 let (index, done) = (network_index.clone(), network_done.clone());
                 std::thread::spawn(move || {
-                    scan_mapped(&root, |entries| {
+                    scan_mapped(&root, &nested, |entries| {
                         let current = crate::settings::get();
-                        if (!current.files && !current.excel) || current.excluded(&root)
-                            || (!current.profile && !current.folders.iter().any(|p| p.eq_ignore_ascii_case(&root))) { return; }
+                        let wanted = current.folders.iter().any(|p| p.eq_ignore_ascii_case(&root)) || (current.profile && root.len() == 3);
+                        if (!current.files && !current.excel) || current.excluded(&root) || !wanted { return; }
                         index.mapped.write().unwrap().insert(root.clone(), Arc::new(entries.to_vec()));
                         index.generation.fetch_add(1, Ordering::Relaxed);
                         done();
@@ -571,22 +571,42 @@ fn mapped_roots() -> Vec<String> {
     }).collect()
 }
 
-fn scan_mapped(root: &str, mut publish: impl FnMut(&[Entry])) {
+/// Mapped drives (with default locations on) plus each network folder added in
+/// settings. An added folder is a root of its own, so its depth and size limits
+/// count from the folder rather than from the top of a large share.
+fn network_roots(drives: Vec<String>, folders: &[String]) -> Vec<String> {
+    let mut roots = drives;
+    for folder in folders.iter().filter(|f| !local_path(f)) {
+        if !roots.iter().any(|r| r.eq_ignore_ascii_case(folder)) {
+            roots.push(folder.clone());
+        }
+    }
+    roots
+}
+
+/// Whether `folder` lies strictly inside `root`.
+fn inside(folder: &str, root: &str) -> bool {
+    crate::settings::within(folder, root) && !crate::settings::within(root, folder)
+}
+
+fn scan_mapped(root: &str, nested: &[String], mut publish: impl FnMut(&[Entry])) {
     let settings = crate::settings::get();
+    // A whole share is sampled; a folder the user added is listed in full.
+    let (max_entries, max_time) = if root.len() <= 3 { (20_000, Duration::from_secs(30)) } else { (100_000, Duration::from_secs(60)) };
     let mut entries = Vec::new();
     let mut queue = VecDeque::from([(PathBuf::from(root), 0usize)]);
     let start = Instant::now();
     let mut last_publish = Instant::now();
     while let Some((dir, depth)) = queue.pop_front() {
         if settings.excluded(&dir.to_string_lossy()) { continue; }
-        if start.elapsed() > Duration::from_secs(30) {
+        if start.elapsed() > max_time {
             break;
         }
         let Ok(children) = std::fs::read_dir(dir) else {
             continue;
         };
         for child in children.flatten() {
-            if start.elapsed() > Duration::from_secs(30) || entries.len() >= 20_000 {
+            if start.elapsed() > max_time || entries.len() >= max_entries {
                 publish(&entries);
                 return;
             }
@@ -608,7 +628,8 @@ fn scan_mapped(root: &str, mut publish: impl FnMut(&[Entry])) {
                 if kind.is_dir() { Kind::Folder } else { Kind::File },
                 depth + 1,
             ));
-            let skipped = entries.last().is_some_and(|e: &Entry| SKIP_DIRS.contains(&e.lower.as_str()) || package_folder(&e.location));
+            let skipped = entries.last().is_some_and(|e: &Entry| SKIP_DIRS.contains(&e.lower.as_str()) || package_folder(&e.location))
+                || nested.iter().any(|n| crate::settings::within(&path.to_string_lossy(), n));
             if kind.is_dir() && depth < 4 && !skipped {
                 queue.push_back((path, depth + 1));
             }
@@ -1427,9 +1448,33 @@ mod tests {
     fn drive_scan_publishes_top_level_before_nested_files() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
         let mut snapshots = Vec::new();
-        scan_mapped(root, |entries| snapshots.push(entries.to_vec()));
+        scan_mapped(root, &[], |entries| snapshots.push(entries.to_vec()));
         assert!(snapshots[0].iter().any(|e| e.name == "fixtures" && e.kind == Kind::Folder));
         assert!(!snapshots[0].iter().any(|e| e.name == "budget.xlsx"));
         assert!(snapshots.last().unwrap().iter().any(|e| e.name == "budget.xlsx"));
+    }
+
+    /// Run on a PC with the share: LUMEN_SCAN_ROOT=W:\accounts\sm LUMEN_SCAN_FIND=0000340836
+    #[test]
+    #[ignore = "needs a real network folder"]
+    fn added_network_folder_reaches_deep_files() {
+        let (root, find) = (std::env::var("LUMEN_SCAN_ROOT").unwrap(), std::env::var("LUMEN_SCAN_FIND").unwrap());
+        let start = Instant::now();
+        let mut last = Vec::new();
+        scan_mapped(&root, &[], |entries| last = entries.to_vec());
+        println!("{} entries in {:?}", last.len(), start.elapsed());
+        assert!(last.iter().any(|e| e.name.contains(&find)), "{find} not found under {root}");
+    }
+
+    #[test]
+    fn drive_scan_leaves_added_folders_to_their_own_scan() {
+        assert!(inside(r"W:\accounts\sm", r"W:\"));
+        assert!(!inside(r"W:\", r"W:\accounts\sm"));
+        assert!(!inside(r"W:\Accounts\SM", r"w:\accounts\sm"));
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+        let mut last = Vec::new();
+        scan_mapped(root, &[format!(r"{root}\fixtures")], |entries| last = entries.to_vec());
+        assert!(last.iter().any(|e| e.name == "fixtures" && e.kind == Kind::Folder));
+        assert!(!last.iter().any(|e| e.name == "budget.xlsx"), "the added folder's own worker lists its files");
     }
 }
