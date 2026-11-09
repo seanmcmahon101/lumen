@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory)][string] $Setup,
-    [Parameter(Mandatory)][string] $App
+    [Parameter(Mandatory)][string] $App,
+    # Until SignPath is approved, releases ship unsigned; skip signature checks.
+    [switch] $Unsigned
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,13 +12,15 @@ if ($env:GITHUB_ACTIONS -ne 'true') {
 $setupPath = (Resolve-Path -LiteralPath $Setup).Path
 $appPath = (Resolve-Path -LiteralPath $App).Path
 $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($appPath).ProductVersion
-$publisher = (Get-AuthenticodeSignature -LiteralPath $appPath).SignerCertificate.Thumbprint
+$publisher = if ($Unsigned) { $null } else { (Get-AuthenticodeSignature -LiteralPath $appPath).SignerCertificate.Thumbprint }
 $install = Join-Path $env:LOCALAPPDATA 'Lumen'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Lumen.lnk'
 $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
 
 function Assert-InstalledSignatures {
-    & "$PSScriptRoot/verify-windows-signature.ps1" -Path "$install/lumen.exe", "$install/unins000.exe" -ProductVersion $version -PublisherThumbprint $publisher
+    if (!$Unsigned) {
+        & "$PSScriptRoot/verify-windows-signature.ps1" -Path "$install/lumen.exe", "$install/unins000.exe" -ProductVersion $version -PublisherThumbprint $publisher
+    }
     if ((Get-FileHash "$install/lumen.exe").Hash -ne (Get-FileHash $appPath).Hash) {
         throw 'Installed app differs from the signed build'
     }

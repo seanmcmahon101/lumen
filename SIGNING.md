@@ -25,8 +25,9 @@ Each signing request requires the maintainer's approval in SignPath.
 The app, Inno Setup uninstaller and installer must have matching Lumen product
 metadata, valid embedded Authenticode signatures, and trusted timestamps.
 The workflow verifies the installed app and uninstaller as well as the download.
-Missing credentials, signing failures or invalid signatures stop publication;
-there is no unsigned release fallback. The fixed-name and versioned downloads
+Once the SignPath credentials are configured, signing failures or invalid
+signatures stop publication. Until then, the workflow publishes unsigned
+installers and says so in the release notes. The fixed-name and versioned downloads
 contain the same signed installer. SHA-256 checksums accompany them.
 
 See [PRIVACY.md](PRIVACY.md) for what remains local and which actions contact
