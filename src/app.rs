@@ -93,6 +93,7 @@ enum Action {
     SetAlias(String, crate::library::Saved),
     RemoveAlias(String),
     Preview(crate::library::Saved, String),
+    AddFolder(String),
     Reindex,
     Noop,
 }
@@ -127,6 +128,7 @@ impl Action {
             Action::SetAlias(..) => "Save",
             Action::RemoveAlias(_) => "Remove",
             Action::Preview(..) => "Preview",
+            Action::AddFolder(_) => "Add",
             Action::Reindex => "Refresh",
             Action::Noop => return None,
         })
@@ -809,6 +811,18 @@ impl Lumen {
             Action::Preview(saved, terms) => {
                 self.command_target = Some(self.saved_item(saved)); self.preview_terms = terms.clone(); self.preview_key = None;
                 self.navigate("/preview".into()); return;
+            }
+            Action::AddFolder(folder) => {
+                // One check on Enter, never while typing; a network drive may answer slowly.
+                if crate::index::local_path(folder) && !std::path::Path::new(folder).is_dir() {
+                    self.search_note = format!("{folder} is not a folder on this PC"); return;
+                }
+                let mut settings = crate::settings::get();
+                settings.folders.push(folder.clone());
+                if let Err(error) = settings.validate() { self.search_note = error.into(); return; }
+                crate::settings::set(settings);
+                let _ = self.watch_tx.send(());
+                self.reindex(); self.navigate("/status".into()); return;
             }
             Action::Reindex => { self.reindex(); self.navigate("/status".into()); return; }
             _ => {}
@@ -1568,6 +1582,7 @@ fn command_glyph(name: &str) -> Option<char> {
         "convert" => G_CONVERT,
         "date" => G_CALENDAR,
         "settings" => G_SETTINGS,
+        "index" => G_FOLDER,
         "reindex" => G_REFRESH,
         "status" => G_STATUS,
         "perf" => G_SPEED,
@@ -1592,6 +1607,7 @@ fn command_title(name: &str) -> &'static str {
         "convert" => "Convert units",
         "date" => "Dates",
         "settings" => "Settings",
+        "index" => "Add a folder",
         "reindex" => "Refresh the index",
         "status" => "Index status",
         "perf" => "Performance",
@@ -1786,6 +1802,21 @@ mod tests {
         assert!(!app.searching); assert!(app.results.iter().any(|i| i.title == "Keyboard shortcuts"));
         assert!(!app.results.iter().any(|i| matches!(&i.action, Action::Open(url) if url.contains("google"))));
         app.query = "/unknown".into(); app.refresh(); assert_eq!(app.results[0].title, "Unknown command");
+    }
+
+    #[test]
+    fn index_command_offers_only_full_local_or_mapped_folders() {
+        let mut app = launcher();
+        for (query, title) in [
+            ("/index", "Choose a folder to add"),
+            ("/index Work", "Use a full folder path"),
+            (r"/index \\server\share", "Use a mapped drive for network folders"),
+        ] {
+            app.query = query.into(); app.refresh();
+            assert_eq!(app.results[0].title, title);
+        }
+        app.query = r#"/index "Q:/Lumen Test""#.into(); app.refresh();
+        assert!(matches!(&app.results[0].action, Action::AddFolder(f) if f == r"Q:\Lumen Test"));
     }
 
     #[test]

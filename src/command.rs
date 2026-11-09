@@ -97,6 +97,12 @@ pub const COMMANDS: &[Command] = &[
         example: "/settings",
     },
     Command {
+        name: "index",
+        usage: "/index [full folder path]",
+        description: "Add the selected folder, or a full path, to the folders Lumen searches",
+        example: "/index C:\\Work",
+    },
+    Command {
         name: "reindex",
         usage: "/reindex",
         description: "Refresh the saved index in the background",

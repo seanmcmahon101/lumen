@@ -512,6 +512,60 @@ impl Lumen {
                     }
                 }
             }
+            "index" => {
+                let folder = if argument.is_empty() {
+                    self.command_target
+                        .as_ref()
+                        .and_then(|i| i.saved.as_ref())
+                        .filter(|s| s.kind == Kind::Folder)
+                        .map(|s| s.path.clone())
+                } else {
+                    Some(argument.trim_matches('"').replace('/', "\\"))
+                };
+                let Some(folder) = folder else {
+                    self.info(
+                        "Choose a folder to add",
+                        "Select a folder in the results first, or use /index C:\\Work.",
+                    );
+                    return true;
+                };
+                let settings = crate::settings::get();
+                let mut searched = crate::index::scan_roots();
+                if settings.profile
+                    && let Ok(profile) = std::env::var("USERPROFILE")
+                {
+                    searched.push(profile.into());
+                }
+                if !std::path::Path::new(&folder).is_absolute() {
+                    self.info("Use a full folder path", "For example /index C:\\Work.");
+                } else if folder.starts_with("\\\\") {
+                    self.info(
+                        "Use a mapped drive for network folders",
+                        "Map the share to a drive letter, then add that path.",
+                    );
+                } else if settings.excluded(&folder) {
+                    self.info(
+                        "This folder is left out of search",
+                        "Remove it from Leave out in /settings first.",
+                    );
+                } else if let Some(root) = searched
+                    .iter()
+                    .find(|root| crate::settings::within(&folder, &root.to_string_lossy()))
+                {
+                    self.info(
+                        "Lumen already searches this folder",
+                        &format!("It is inside {}", root.to_string_lossy()),
+                    );
+                } else {
+                    self.results.push(simple(
+                        &format!("Add {folder} to search"),
+                        "Lumen indexes it in the background and watches it for changes",
+                        "",
+                        G_FOLDER,
+                        Action::AddFolder(folder),
+                    ));
+                }
+            }
             "settings" => {}
             "reindex" => self.results.push(simple(
                 "Refresh the search index",
