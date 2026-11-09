@@ -48,20 +48,28 @@ pub struct Settings {
     /// Shared folders already added for this user, so one removed in
     /// preferences is not added again.
     pub shared_added: Vec<String>,
+    /// Folders added because this user opens them often. Like shared folders,
+    /// one removed in preferences is not added again.
+    pub recent_added: Vec<String>,
 }
 
 /// Team folders indexed for everyone whose PC can reach them.
 const SHARED_FOLDERS: [&str; 1] = [r"W:\Accounts\SM\AP INVOICE PROJECT"];
 
-/// Adds each reachable shared folder not added before. Returns whether settings
-/// changed. Call off the UI thread: a mapped drive may answer slowly.
+/// Adds each reachable shared folder and, with default locations on, the
+/// folders this user opens most that Lumen does not already cover, unless added
+/// before. Returns whether settings changed. Call off the UI thread: a mapped
+/// drive may answer slowly.
 pub fn add_shared_folders() -> bool {
     let reachable: Vec<&str> = SHARED_FOLDERS
         .into_iter()
         .filter(|f| std::path::Path::new(f).is_dir())
         .collect();
+    let before = get();
+    let used = if before.profile { crate::recent::folders(|f| before.covers(f)) } else { Vec::new() };
+    let used: Vec<&str> = used.iter().map(String::as_str).collect();
     let mut settings = get();
-    let changed = settings.add_shared(&reachable);
+    let changed = settings.add_shared(&reachable) | settings.add_recent(&used);
     if changed {
         set(settings);
     }
@@ -80,6 +88,7 @@ impl Default for Settings {
             folders: Vec::new(),
             exclusions: Vec::new(),
             shared_added: Vec::new(),
+            recent_added: Vec::new(),
         }
     }
 }
@@ -114,20 +123,41 @@ pub fn within(path: &str, folder: &str) -> bool {
                 .is_some_and(|c| *c == b'\\' || *c == b'/')
 }
 
+/// Adds each folder not in `added` to `added` and `folders`. Returns whether it added any.
+fn add_once(added: &mut Vec<String>, folders: &mut Vec<String>, new: &[&str]) -> bool {
+    let mut changed = false;
+    for folder in new {
+        if added.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+            continue;
+        }
+        added.push((*folder).into());
+        if !folders.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
+            folders.push((*folder).into());
+        }
+        changed = true;
+    }
+    changed
+}
+
 impl Settings {
     fn add_shared(&mut self, reachable: &[&str]) -> bool {
-        let mut changed = false;
-        for folder in reachable {
-            if self.shared_added.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
-                continue;
-            }
-            self.shared_added.push((*folder).into());
-            if !self.folders.iter().any(|f| f.eq_ignore_ascii_case(folder)) {
-                self.folders.push((*folder).into());
-            }
-            changed = true;
-        }
-        changed
+        add_once(&mut self.shared_added, &mut self.folders, reachable)
+    }
+    fn add_recent(&mut self, used: &[&str]) -> bool {
+        add_once(&mut self.recent_added, &mut self.folders, used)
+    }
+    /// Whether `root` was added from recent use rather than by the user.
+    pub fn added_from_recent(&self, root: &str) -> bool {
+        self.recent_added.iter().any(|f| f.eq_ignore_ascii_case(root))
+    }
+    /// Whether Lumen already indexes all of `folder`, or this user has had it
+    /// added before (and may have removed it since).
+    fn covers(&self, folder: &str) -> bool {
+        self.excluded(folder)
+            || self.shared_added.iter().chain(&self.recent_added).chain(&self.folders).any(|f| f.eq_ignore_ascii_case(folder))
+            || self.profile && std::env::var("USERPROFILE").is_ok_and(|profile| within(folder, &profile))
+            // Local folders are walked in full; a network folder is sampled to a few levels.
+            || crate::index::scan_roots().iter().map(|root| root.to_string_lossy()).any(|root| crate::index::local_path(&root) && within(folder, &root))
     }
     pub fn excluded(&self, path: &str) -> bool {
         self.exclusions.iter().any(|f| within(path, f))
@@ -174,6 +204,16 @@ mod tests {
         s.folders.clear();
         assert!(!s.add_shared(&[r"w:\team\invoices"]));
         assert!(s.folders.is_empty());
+    }
+    #[test]
+    fn folder_from_recent_use_is_added_once_and_stays_removed() {
+        let mut s = Settings::default();
+        assert!(s.add_recent(&[r"W:\Team\Reports"]));
+        assert!(s.added_from_recent(r"w:\team\reports") && !s.added_from_recent(r"W:\Team"));
+        s.folders.clear();
+        assert!(!s.add_recent(&[r"W:\Team\Reports"]));
+        assert!(s.folders.is_empty());
+        assert!(s.covers(r"W:\TEAM\REPORTS"), "a removed folder is not suggested again");
     }
     #[test]
     fn invalid_preferences_keep_existing_state() {

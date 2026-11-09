@@ -589,10 +589,23 @@ fn inside(folder: &str, root: &str) -> bool {
     crate::settings::within(folder, root) && !crate::settings::within(root, folder)
 }
 
+/// How many entries, and how long, a network scan of `root` may take. A whole
+/// share is sampled; a folder the user added is listed in full. A folder added
+/// from recent use gets enough for a working folder, so a broad one such as a
+/// department's root cannot slow every search.
+fn scan_budget(root: &str, settings: &crate::settings::Settings) -> (usize, Duration) {
+    if root.len() <= 3 {
+        (20_000, Duration::from_secs(30))
+    } else if settings.added_from_recent(root) {
+        (5_000, Duration::from_secs(30))
+    } else {
+        (100_000, Duration::from_secs(60))
+    }
+}
+
 fn scan_mapped(root: &str, nested: &[String], mut publish: impl FnMut(&[Entry])) {
     let settings = crate::settings::get();
-    // A whole share is sampled; a folder the user added is listed in full.
-    let (max_entries, max_time) = if root.len() <= 3 { (20_000, Duration::from_secs(30)) } else { (100_000, Duration::from_secs(60)) };
+    let (max_entries, max_time) = scan_budget(root, &settings);
     let mut entries = Vec::new();
     let mut queue = VecDeque::from([(PathBuf::from(root), 0usize)]);
     let start = Instant::now();
@@ -1464,6 +1477,18 @@ mod tests {
         scan_mapped(&root, &[], |entries| last = entries.to_vec());
         println!("{} entries in {:?}", last.len(), start.elapsed());
         assert!(last.iter().any(|e| e.name.contains(&find)), "{find} not found under {root}");
+    }
+
+    #[test]
+    fn folders_added_from_recent_use_get_a_smaller_scan() {
+        let settings = crate::settings::Settings {
+            folders: vec![r"W:\Team".into(), r"W:\Busy".into()],
+            recent_added: vec![r"W:\Busy".into()],
+            ..Default::default()
+        };
+        assert_eq!(scan_budget(r"W:\", &settings).0, 20_000);
+        assert_eq!(scan_budget(r"W:\Team", &settings).0, 100_000);
+        assert_eq!(scan_budget(r"w:\busy", &settings).0, 5_000);
     }
 
     #[test]

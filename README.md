@@ -142,7 +142,18 @@ scanned, excluding build caches and hidden/system files. Mapped network drives a
 indexed separately, with top-level folders published first. Each drive has a
 20,000-entry, five-level, 30-second traversal budget (an in-flight Windows network
 read can exceed that budget without blocking the UI). Network files are indexed
-by name and path only. Exact folder matches outrank incidental file prefixes. Indexing refreshes every
+by name and path only. Exact folder matches outrank incidental file prefixes.
+
+Lumen also adds the folders you use most outside your profile, on mapped drives
+and other local drives, so their files are searchable even when a drive sample
+stops short of them. It reads
+them from the Windows jump lists behind Quick Access and taskbar recent items:
+folders pinned in Quick Access, and folders you opened at least 10 times in the
+last six months, up to 15 per check. Opening a file counts toward its folder.
+Lumen checks at each start, skips folders it already covers, and lists each added
+folder up to 5,000 entries so a broad one cannot slow search. They appear with
+your additional folders in `/settings`; one you remove is not added again.
+Turning off **Default locations** stops this. Indexing refreshes every
 15 minutes, with a 250,000-entry and 20-level traversal limit. Cloud-only files can
 match by filename; content indexing does not download them.
 

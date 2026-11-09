@@ -6,6 +6,12 @@ Lumen does not upload your files, workbook contents, email contents, search
 history or search terms to a Lumen server or signing provider. It does not
 include advertising or usage analytics.
 
+To choose folders worth indexing, Lumen reads the Windows jump lists on your PC
+(the recent and pinned items behind Quick Access and taskbar menus). It uses
+only item paths, open counts and dates, saves only the folders it adds to your
+settings, and does not change or upload the jump lists. Turning off
+**Default locations** in `/settings` stops this.
+
 Lumen checks this project's public GitHub releases for updates at startup and
 periodically while it runs. GitHub receives the normal network information
 needed to serve that request, including your IP address; your search terms and

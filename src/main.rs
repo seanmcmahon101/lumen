@@ -12,6 +12,7 @@ mod library;
 mod mail;
 mod metrics;
 mod preview;
+mod recent;
 mod settings;
 mod storage;
 mod system;
