@@ -30,16 +30,9 @@ pub fn spawn(
     });
     (tx, rx)
 }
+/// The same files the index reads workbook text from.
 pub fn supported(path: &str) -> bool {
-    matches!(
-        std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" | "csv" | "tsv" | "xltx" | "xltm"
-    )
+    crate::index::spreadsheet(&path.to_lowercase())
 }
 pub fn read(path: &str, query: &str) -> Result<Vec<Line>, String> {
     if !supported(path) {
@@ -50,10 +43,10 @@ pub fn read(path: &str, query: &str) -> Result<Vec<Line>, String> {
     }
     let md = std::fs::metadata(path)
         .map_err(|_| "This file is unavailable. Check its location and try again.")?;
-    if md.len() > 16 * 1024 * 1024 {
+    if md.len() > crate::index::MAX_SOURCE_BYTES {
         return Err("This workbook exceeds the 16 MB preview limit. Open it to read more.".into());
     }
-    if md.file_attributes() & (0x1000 | 0x40000 | 0x400000) != 0 {
+    if md.file_attributes() & crate::index::CLOUD_PLACEHOLDER != 0 {
         return Err(
             "This file is online only. Download it in File Explorer before previewing.".into(),
         );

@@ -62,7 +62,7 @@ fn check() -> Option<Update> {
         Invoke-RestMethod -TimeoutSec 8 'https://api.github.com/repos/seanmcmahon101/lumen/releases/latest' | ConvertTo-Json -Depth 5 -Compress";
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(0x0800_0000)
+        .creation_flags(crate::win::NO_WINDOW)
         .output()
         .ok()?;
     if !output.status.success() {

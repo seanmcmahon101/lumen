@@ -85,13 +85,17 @@ impl Lumen {
             self.appearance = self.settings_appearance;
             self.appearance.save();
         }
-        if draft == crate::settings::get() {
-            // Only the look changed, so there is nothing to index again.
+        let current = crate::settings::get();
+        let rescan = draft.indexing() != current.indexing();
+        if draft != current {
+            crate::settings::set(draft.clone());
+            self.settings_draft = draft;
+        }
+        if !rescan {
+            // Only the look or the shortcut changed, so there is nothing to index again.
             self.navigate(self.return_query.clone());
             return;
         }
-        crate::settings::set(draft.clone());
-        self.settings_draft = draft;
         let _ = self.watch_tx.send(());
         self.reindex();
         self.navigate("/status".into());

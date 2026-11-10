@@ -30,6 +30,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
+/// CREATE_NO_WINDOW: helper processes never flash a console.
+pub const NO_WINDOW: u32 = 0x0800_0000;
+
 static HWND_VAL: AtomicIsize = AtomicIsize::new(0);
 static TARGET_MONITOR: AtomicIsize = AtomicIsize::new(0);
 pub static VISIBLE: AtomicBool = AtomicBool::new(false);
@@ -502,26 +505,6 @@ fn pick_keys(query: &str) -> Vec<String> {
     keys
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn picks_learn_prefixes_behind_filters() {
-        assert_eq!(pick_keys("jd"), ["jd"]);
-        assert_eq!(pick_keys("Excel  Bud"), ["excel bu", "excel bud"]);
-        assert_eq!(pick_keys("j"), Vec::<String>::new());
-        assert_eq!(pick_keys("mail "), Vec::<String>::new());
-        let mut history = History { counts: HashMap::new(), picks: HashMap::new() };
-        for key in pick_keys("john d") {
-            history.picks.insert(key, "C:\\jd.xlsx".into());
-        }
-        assert_eq!(history.pick("JO"), Some("C:\\jd.xlsx"));
-        assert_eq!(history.pick("john  d"), Some("C:\\jd.xlsx"));
-        assert_eq!(history.pick("excel jo"), None);
-    }
-}
-
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 
 /// The command Windows runs for Lumen at login, if any.
@@ -572,5 +555,25 @@ pub fn migrate_startup() {
         && !command.contains("--background")
     {
         write_startup(Some(&format!("{command} --background")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_learn_prefixes_behind_filters() {
+        assert_eq!(pick_keys("jd"), ["jd"]);
+        assert_eq!(pick_keys("Excel  Bud"), ["excel bu", "excel bud"]);
+        assert_eq!(pick_keys("j"), Vec::<String>::new());
+        assert_eq!(pick_keys("mail "), Vec::<String>::new());
+        let mut history = History { counts: HashMap::new(), picks: HashMap::new() };
+        for key in pick_keys("john d") {
+            history.picks.insert(key, "C:\\jd.xlsx".into());
+        }
+        assert_eq!(history.pick("JO"), Some("C:\\jd.xlsx"));
+        assert_eq!(history.pick("john  d"), Some("C:\\jd.xlsx"));
+        assert_eq!(history.pick("excel jo"), None);
     }
 }

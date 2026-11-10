@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(
     clippy::enum_variant_names,
     reason = "The saved values name complete key chords."
@@ -34,7 +34,7 @@ impl Hotkey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub hotkey: Hotkey,
@@ -104,8 +104,14 @@ pub fn get() -> Settings {
 }
 
 pub fn set(settings: Settings) {
-    *current().write().unwrap() = settings.clone();
-    REVISION.fetch_add(1, Ordering::Release);
+    {
+        let mut current = current().write().unwrap();
+        // The revision tells a running scan that it was built for other settings.
+        if current.indexing() != settings.indexing() {
+            REVISION.fetch_add(1, Ordering::Release);
+        }
+        *current = settings.clone();
+    }
     crate::hook::set_hotkey(settings.hotkey);
     crate::tray::refresh_tip();
     crate::storage::save("settings.json", &settings);
@@ -158,6 +164,11 @@ impl Settings {
             || self.profile && std::env::var("USERPROFILE").is_ok_and(|profile| within(folder, &profile))
             // Local folders are walked in full; a network folder is sampled to a few levels.
             || crate::index::scan_roots().iter().map(|root| root.to_string_lossy()).any(|root| crate::index::local_path(&root) && within(folder, &root))
+    }
+    /// These settings without the ones search results do not depend on, so that
+    /// changing the shortcut neither rescans files nor discards the saved index.
+    pub fn indexing(&self) -> Self {
+        Self { hotkey: Hotkey::default(), ..self.clone() }
     }
     pub fn excluded(&self, path: &str) -> bool {
         self.exclusions.iter().any(|f| within(path, f))

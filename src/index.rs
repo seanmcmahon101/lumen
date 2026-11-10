@@ -16,7 +16,10 @@ const MAX_FILES: usize = 250_000;
 const MAX_DEPTH: usize = 20;
 const SKIP_DIRS: &[&str] = &["appdata", "node_modules", "bin", "obj", "__pycache__", "venv", "site-packages", "packages", "target"];
 const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Larger files are searchable by name only, and are not previewed.
+pub(crate) const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+/// Offline, recall-on-open and recall-on-data-access: reading these would download them.
+pub(crate) const CLOUD_PLACEHOLDER: u32 = 0x1000 | 0x40000 | 0x400000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
@@ -190,6 +193,7 @@ pub struct Index {
     scanning_drives: Mutex<HashSet<String>>,
     changes: RwLock<Arc<Changes>>,
     cached: AtomicBool,
+    saved: AtomicU64, // fingerprint of the snapshot in the cache file; 0 while there is none
 }
 
 impl Index {
@@ -197,11 +201,14 @@ impl Index {
     pub fn start(self: &Arc<Self>, on_done: impl Fn() + Send + Sync + 'static) {
         let me = self.clone();
         std::thread::spawn(move || {
-            if let Some(entries) = load_cache(&crate::settings::get()) {
-                *me.entries.write().unwrap() = Arc::new(entries);
+            let settings = crate::settings::get();
+            if let Some(entries) = load_cache(&settings) {
+                let entries = Arc::new(entries);
+                *me.entries.write().unwrap() = entries.clone();
                 me.cached.store(true, Ordering::Relaxed);
                 me.generation.fetch_add(1, Ordering::Relaxed);
                 on_done();
+                me.saved.store(fingerprint(&settings, &entries), Ordering::Relaxed);
             }
             me.rebuild(on_done);
         });
@@ -310,7 +317,11 @@ impl Index {
             on_done();
             if revision == crate::settings::REVISION.load(Ordering::Acquire) {
                 let snapshot = me.entries.read().unwrap().clone();
-                save_cache(&settings, &snapshot);
+                // Most refreshes find nothing new: do not write the whole index out again.
+                let print = fingerprint(&settings, &snapshot);
+                if me.saved.load(Ordering::Relaxed) != print && save_cache(&settings, &snapshot) {
+                    me.saved.store(print, Ordering::Relaxed);
+                }
             }
             if me.rebuild_again.swap(false, Ordering::SeqCst) {
                 me.rebuild_impl(on_done.clone());
@@ -439,6 +450,10 @@ impl Index {
             })
             .map(|(_, token)| token)
             .collect();
+        // Only an unfinished "ext:" so far: nothing to look for yet, rather than everything.
+        if tokens.is_empty() && scope.is_empty() && ext.is_empty() {
+            return Vec::new();
+        }
         let needle = tokens.join(" ");
         let query = Query { scope, ext, needle: &needle, tokens: &tokens };
 
@@ -688,11 +703,13 @@ fn score(e: &Entry, q: &str, tokens: &[&str]) -> i32 {
     s - n.len().min(60) as i32
 }
 
-fn extension(path: &str) -> &str {
-    path.rsplit('.').next().unwrap_or("")
+/// What follows the last dot of a lowercase name; nothing for a name without one.
+fn extension(name: &str) -> &str {
+    name.rsplit_once('.').map_or("", |(_, extension)| extension)
 }
-fn spreadsheet(path: &str) -> bool {
-    matches!(extension(path), "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" | "csv" | "tsv" | "xltx" | "xltm")
+/// A workbook or delimited text file, by its lowercase name or path.
+pub(crate) fn spreadsheet(name: &str) -> bool {
+    matches!(extension(name), "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" | "csv" | "tsv" | "xltx" | "xltm")
 }
 
 fn contextual_score(e: &Entry, tokens: &[&str]) -> i32 {
@@ -785,7 +802,7 @@ fn enrich(e: &mut Entry) {
     let Ok(md) = std::fs::metadata(&e.path) else {
         return;
     };
-    if md.len() > 16 * 1024 * 1024 || md.file_attributes() & (0x1000 | 0x40000 | 0x400000) != 0 {
+    if md.len() > MAX_SOURCE_BYTES || md.file_attributes() & CLOUD_PLACEHOLDER != 0 {
         e.read = true; // Deliberately skipped; a changed stamp makes it eligible again.
         return;
     }
@@ -883,7 +900,7 @@ fn start_apps() -> Vec<Entry> {
     let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress";
     let Ok(out) = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(crate::win::NO_WINDOW)
         .output()
     else {
         return Vec::new();
@@ -1050,7 +1067,19 @@ fn cache_file() -> Option<PathBuf> {
 
 fn decode_cache(bytes: &[u8], settings: &crate::settings::Settings) -> Option<Vec<Entry>> {
     let (version, saved_settings, entries): (u8, crate::settings::Settings, Vec<Entry>) = serde_json::from_slice(bytes).ok()?;
-    (version == 1 && saved_settings == *settings && entries.len() <= MAX_FILES + 10_000).then_some(entries)
+    (version == 1 && saved_settings.indexing() == settings.indexing() && entries.len() <= MAX_FILES + 10_000).then_some(entries)
+}
+
+/// Identifies what the cache file would hold, within this run of Lumen, so that an
+/// unchanged index is not written again after every refresh.
+fn fingerprint(settings: &crate::settings::Settings, entries: &[Entry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    settings.indexing().hash(&mut hasher);
+    for e in entries {
+        (&e.name, &e.path, e.kind as u8, e.depth, e.stamp, e.read, &e.content, &e.detail).hash(&mut hasher);
+    }
+    hasher.finish().max(1)
 }
 
 fn load_cache(settings: &crate::settings::Settings) -> Option<Vec<Entry>> {
@@ -1059,9 +1088,11 @@ fn load_cache(settings: &crate::settings::Settings) -> Option<Vec<Entry>> {
     decode_cache(&std::fs::read(file).ok()?, settings)
 }
 
-fn save_cache(settings: &crate::settings::Settings, entries: &[Entry]) {
-    if let (Some(file), Ok(bytes)) = (cache_file(), serde_json::to_vec(&(1u8, settings, entries))) {
-        let _ = crate::storage::atomic_write(&file, &bytes);
+/// Whether the snapshot reached the disk.
+fn save_cache(settings: &crate::settings::Settings, entries: &[Entry]) -> bool {
+    match (cache_file(), serde_json::to_vec(&(1u8, settings, entries))) {
+        (Some(file), Ok(bytes)) => crate::storage::atomic_write(&file, &bytes).is_ok(),
+        _ => false,
     }
 }
 
@@ -1086,6 +1117,30 @@ mod tests {
         assert_eq!(loaded[0].stamp, (42, 123, 0));
         let mut changed = settings.clone(); changed.exclusions.push(r"C:\Work".into());
         assert!(decode_cache(&bytes, &changed).is_none()); assert!(decode_cache(b"broken", &settings).is_none());
+        let mut rebound = settings.clone(); rebound.hotkey = crate::settings::Hotkey::AltSpace;
+        assert!(decode_cache(&bytes, &rebound).is_some(), "the shortcut does not change what is indexed");
+    }
+
+    #[test]
+    fn an_unchanged_index_keeps_its_fingerprint_and_any_change_alters_it() {
+        let settings = crate::settings::Settings::default();
+        let mut e = Entry::new("budget.xlsx".into(), r"C:\Work\budget.xlsx".into(), Kind::File, 2);
+        e.content = "revenue".into(); e.read = true; e.stamp = (42, 123, 0);
+        let entries = vec![e];
+        let print = fingerprint(&settings, &entries);
+        assert_ne!(print, 0, "zero means nothing has been saved");
+        assert_eq!(print, fingerprint(&settings, &entries.clone()), "a refresh that finds nothing new needs no write");
+        let mut rebound = settings.clone(); rebound.hotkey = crate::settings::Hotkey::AltSpace;
+        assert_eq!(print, fingerprint(&rebound, &entries));
+
+        let mut saved_again = entries.clone(); saved_again[0].stamp.1 += 1;
+        let mut reread = entries.clone(); reread[0].content.push_str(" forecast");
+        let mut failed = entries.clone(); failed[0].read = false;
+        for changed in [saved_again, reread, failed, Vec::new()] {
+            assert_ne!(print, fingerprint(&settings, &changed));
+        }
+        let mut excluded = settings.clone(); excluded.exclusions.push(r"C:\Work".into());
+        assert_ne!(print, fingerprint(&excluded, &entries));
     }
 
     fn idx(items: &[(&str, Kind)]) -> Index {
@@ -1353,6 +1408,21 @@ mod tests {
         assert_eq!(index.search("ext:xlsm forecast", 10, |_| 0).len(), 1);
         assert!(index.search("excel budget unrelated", 10, |_| 0).is_empty());
         assert!(index.search("budget", 0, |_| 0).is_empty());
+        assert_eq!(index.search("ext:docx", 10, |_| 0).len(), 1);
+        for unfinished in ["ext:", "ext:.", "EXT: "] {
+            assert!(index.search(unfinished, 10, |_| 0).is_empty(), "{unfinished:?} must not list the whole index");
+        }
+    }
+
+    #[test]
+    fn a_name_without_a_dot_has_no_extension() {
+        assert_eq!(extension("q3.final.xlsx"), "xlsx");
+        assert_eq!(extension("makefile"), "");
+        assert!(spreadsheet("forecast.csv") && !spreadsheet("csv") && !spreadsheet("xlsx"));
+        let index = idx(&[("csv", Kind::File), ("sales.csv", Kind::File)]);
+        let names: Vec<String> = index.search("excel", 10, |_| 0).into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["sales.csv"]);
+        assert_eq!(index.search("ext:csv", 10, |_| 0).len(), 1);
     }
 
     #[test]
@@ -1419,7 +1489,7 @@ mod tests {
         let walked = start.elapsed();
         let mut content_bytes = 0;
         for e in &mut list {
-            if content_bytes >= 32 * 1024 * 1024 {
+            if content_bytes >= CONTENT_BUDGET {
                 break;
             }
             enrich(e);

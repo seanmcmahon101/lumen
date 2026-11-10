@@ -115,7 +115,7 @@ pub fn run(target: &'static Target) {
             crate::win::shell_open(target, "open", None);
         }
         Target::Run(program, arguments) => {
-            let _ = std::process::Command::new(program).raw_arg(arguments).creation_flags(0x0800_0000).spawn();
+            let _ = std::process::Command::new(program).raw_arg(arguments).creation_flags(crate::win::NO_WINDOW).spawn();
         }
         Target::Lock => unsafe {
             let _ = windows::Win32::System::Shutdown::LockWorkStation();

@@ -225,7 +225,7 @@ pub struct Lumen {
     scroll_to_selected: bool,
     suppress_scroll_inertia: bool,
     index: Arc<Index>,
-    history: win::History,
+    history: Arc<win::History>, // shared with each search rather than copied per keystroke
     icons: HashMap<String, Option<TextureHandle>>,
     icon_tx: mpsc::Sender<(String, String)>,
     icon_rx: mpsc::Receiver<(String, Option<egui::ColorImage>)>,
@@ -241,7 +241,7 @@ pub struct Lumen {
     available_update: Option<crate::update::Update>,
     pinned: bool, // --show: stay open when focus leaves (testing)
     frames: u32,
-    search_tx: mpsc::Sender<(String, u64, win::History)>,
+    search_tx: mpsc::Sender<(String, u64, Arc<win::History>)>,
     search_rx: mpsc::Receiver<(String, u64, Vec<Entry>, String)>,
     search_key: Option<(String, u64)>,
     found: Vec<Entry>,
@@ -347,7 +347,7 @@ impl Lumen {
                 shared_index.rebuild(move || repaint.request_repaint());
             }
         });
-        let (search_tx, requests) = mpsc::channel::<(String, u64, win::History)>();
+        let (search_tx, requests) = mpsc::channel::<(String, u64, Arc<win::History>)>();
         let (answers, search_rx) = mpsc::channel();
         let latest_query = Arc::new(Mutex::new(String::new()));
         let worker_query = latest_query.clone();
@@ -447,7 +447,7 @@ impl Lumen {
             scroll_to_selected: true,
             suppress_scroll_inertia: false,
             index,
-            history: win::History::load(),
+            history: Arc::new(win::History::load()),
             icons: HashMap::new(),
             icon_tx,
             icon_rx,
@@ -551,8 +551,15 @@ impl Lumen {
 
     fn hide(&mut self) {
         self.cancel_actions();
-        self.display_overlay.close();
+        self.release_display();
         win::hide();
+    }
+
+    /// Closes the dimmers and frees the screen-sized backdrop, which the next
+    /// opening captures again, so a hidden Lumen does not hold it in memory.
+    fn release_display(&mut self) {
+        self.display_overlay.close();
+        self.backdrop = None;
     }
 
     /// Observe native visibility before processing search answers or queued input.
@@ -564,7 +571,7 @@ impl Lumen {
             self.cancel_actions();
         }
         if !visible {
-            self.display_overlay.close();
+            self.release_display();
             return None;
         }
         Some(just_shown)
@@ -579,7 +586,7 @@ impl Lumen {
             self.preview_terms = self.return_query.clone();
             self.preview_key = None;
         }
-        if self.query.trim().eq_ignore_ascii_case("/settings") && text_changed {
+        if is_settings(&self.query) && text_changed {
             self.load_settings_draft();
         }
         if self.query.trim().eq_ignore_ascii_case("/perf") && text_changed {
@@ -622,24 +629,34 @@ impl Lumen {
             self.searching = !crate::command::search_query(&t).is_empty();
             if self.searching { let _ = self.search_tx.send((key.0, key.1, self.history.clone())); }
         }
-        if self.slash_results(&t) { return; }
+        self.build_results(&t);
+        // Commands and the home list keep a browsed selection too, not only searches.
+        if let Some((title, subtitle)) = previous_selection {
+            self.selected = self.results.iter().position(|item| item.title == title && item.subtitle == subtitle).unwrap_or(0);
+            self.scroll_to_selected |= self.selected != previous_index;
+        }
+    }
+
+    /// Fills `results` for the trimmed query `t`.
+    fn build_results(&mut self, t: &str) {
+        if self.slash_results(t) { return; }
         if t.is_empty() {
             self.home_results();
             return;
         }
         let lower = t.to_lowercase();
-        if crate::mail::query(&t).is_some() && !crate::settings::get().mail {
+        if crate::mail::query(t).is_some() && !crate::settings::get().mail {
             self.results.push(simple("Outlook search is disabled", "Enable Outlook in /settings", "Settings", G_SETTINGS, Action::Query("/settings".into())));
             return;
         }
 
-        if let Some(answer) = crate::convert::units(&t) {
+        if let Some(answer) = crate::convert::units(t) {
             self.results.push(answer_item(answer, G_CONVERT, "Conversion"));
-        } else if let Some(answer) = crate::convert::date(&t) {
+        } else if let Some(answer) = crate::convert::date(t) {
             self.results.push(answer_item(answer, G_CALENDAR, "Date"));
         }
 
-        if let Some(v) = calc::eval(&t) {
+        if let Some(v) = calc::eval(t) {
             let (display, raw) = calc::format(v);
             self.results.push(Item {
                 title: display,
@@ -660,12 +677,12 @@ impl Lumen {
         }
 
         if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
-            let url = if lower.starts_with("www.") { format!("https://{t}") } else { t.clone() };
+            let url = if lower.starts_with("www.") { format!("https://{t}") } else { t.to_string() };
             self.results.push(simple(&format!("Open {t}"), "Website", "Web", G_GLOBE, Action::Open(url)));
         } else if t.len() >= 3 && t.as_bytes()[1] == b':' {
-            let mut it = simple(&t, "Open this location", "Path", G_OPEN, Action::Open(t.clone()));
-            it.reveal = Some(t.clone());
-            it.copy = Some(t.clone());
+            let mut it = simple(t, "Open this location", "Path", G_OPEN, Action::Open(t.to_string()));
+            it.reveal = Some(t.to_string());
+            it.copy = Some(t.to_string());
             self.results.push(it);
         }
 
@@ -682,9 +699,9 @@ impl Lumen {
         // Windows Settings and system commands, never behind a filter like "excel ".
         // Exact names go above files; partial names follow all matching files.
         let (exact, partial) =
-            if crate::index::split_filter(&self.query).0.is_empty() { crate::system::find(&t) } else { Default::default() };
+            if crate::index::split_filter(&self.query).0.is_empty() { crate::system::find(t) } else { Default::default() };
         let mut files: Vec<Item> = self.found.iter().map(|e| self.entry_item(e)).collect();
-        if let Some(shortcut) = self.library.pick(&t) {
+        if let Some(shortcut) = self.library.pick(t) {
             let mut item = self.saved_item(shortcut); item.label = "Alias".into();
             files.retain(|i| i.history_key != item.history_key); self.results.push(item);
         }
@@ -698,7 +715,7 @@ impl Lumen {
         self.results.extend(partial.into_iter().map(system_item));
         self.results.extend(commands);
 
-        if let Some(term) = crate::mail::query(&t) {
+        if let Some(term) = crate::mail::query(t) {
             let url = format!("https://outlook.office.com/mail/0/search?q={}", url_encode(term));
             self.results.push(simple(
                 "Search Outlook online",
@@ -708,12 +725,8 @@ impl Lumen {
                 Action::Open(url),
             ));
         } else {
-            let url = format!("https://www.google.com/search?q={}", url_encode(&t));
+            let url = format!("https://www.google.com/search?q={}", url_encode(t));
             self.results.push(simple(&format!("Search the web for \u{201C}{t}\u{201D}"), "Google", "Web", G_SEARCH, Action::Open(url)));
-        }
-        if let Some((title, subtitle)) = previous_selection {
-            self.selected = self.results.iter().position(|item| item.title == title && item.subtitle == subtitle).unwrap_or(0);
-            self.scroll_to_selected |= self.selected != previous_index;
         }
     }
 
@@ -733,7 +746,9 @@ impl Lumen {
             "Application".to_string()
         } else {
             let parent = std::path::Path::new(&e.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            match parent.strip_prefix(&self.profile) {
+            // Only the profile itself, not a sibling whose name starts the same way.
+            let inside = |rest: &&str| !self.profile.is_empty() && (rest.is_empty() || rest.starts_with('\\'));
+            match parent.strip_prefix(&self.profile).filter(inside) {
                 Some("") => "Home".into(),
                 Some(rest) => format!("Home{rest}"),
                 None => parent,
@@ -757,7 +772,7 @@ impl Lumen {
             title,
             subtitle,
             label,
-            glyph: (e.kind == Kind::Email).then_some('\u{E715}'),
+            glyph: (e.kind == Kind::Email).then_some(G_MAIL),
             icon: (e.kind != Kind::Email).then(|| (key, e.path.clone())),
             action: Action::Open(e.path.clone()),
             reveal: (!is_app && e.kind != Kind::Email).then(|| e.path.clone()),
@@ -855,8 +870,9 @@ impl Lumen {
         if opened {
             if let Some(saved) = item.saved { self.library.remember(saved); }
             if let Some(k) = item.history_key.clone() {
-                self.history.bump(&k);
-                if !self.query.trim_start().starts_with('/') { self.history.learn(&self.query, &k); }
+                let history = Arc::make_mut(&mut self.history);
+                history.bump(&k);
+                if !self.query.trim_start().starts_with('/') { history.learn(&self.query, &k); }
             }
         }
         self.search_key = None;
@@ -893,7 +909,7 @@ impl Lumen {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
             self.navigate("/help".into()); return;
         }
-        if self.query.trim().eq_ignore_ascii_case("/settings") {
+        if is_settings(&self.query) {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) { self.navigate(self.return_query.clone()); }
             return;
         }
@@ -1058,7 +1074,9 @@ impl Lumen {
                     self.suppress_scroll_inertia = true;
                     egui::scroll_area::State::default().store(&ctx, ui.make_persistent_id("lumen-results"));
                     let selected = self.selected.min(n - 1);
-                    let offset = self.scroll_offset.clamp((rows.bottom(selected) - list_h).max(0.0), rows.top(selected));
+                    // On a one-row list a row with a group header is taller than the list:
+                    // keep the row itself in view rather than asking for an impossible range.
+                    let offset = self.scroll_offset.min(rows.top(selected)).max(rows.bottom(selected) - list_h);
                     area = area.vertical_scroll_offset(offset);
                     self.scroll_to_selected = false;
                 } else if ctx.input(|input| input.events.iter().any(|event| {
@@ -1218,12 +1236,10 @@ impl Lumen {
             }
         } else {
             let mut x = row.left() + TEXT_X - 10.0;
+            let (scope, term) = scoped(&self.query);
+            let term = term.to_string();
             for (label, prefix) in [("All", ""), ("Spreadsheets", "excel "), ("Outlook", "mail ")] {
-                let active = if prefix.is_empty() {
-                    !self.query.starts_with("excel ") && crate::mail::query(&self.query).is_none()
-                } else {
-                    self.query.starts_with(prefix)
-                };
+                let active = prefix == scope;
                 let weight = if active { 600.0 } else { 500.0 };
                 let galley = painter.layout_job(theme::line(label, theme::text(13.0, weight, Color32::PLACEHOLDER), f32::INFINITY));
                 let rect = Rect::from_min_size(pos2(x, cy - 14.0), vec2(galley.size().x + 20.0, 28.0));
@@ -1237,8 +1253,6 @@ impl Lumen {
                     painter.rect_filled(Rect::from_center_size(pos2(rect.center().x, row.bottom() - 3.5), vec2(16.0, 3.0)), 1.5, p.accent);
                 }
                 if response.clicked() {
-                    let term =
-                        self.query.strip_prefix("excel ").or_else(|| crate::mail::query(&self.query)).unwrap_or(&self.query).to_string();
                     self.query = format!("{prefix}{term}");
                     self.set_cursor(ui.ctx(), false);
                 }
@@ -1552,6 +1566,21 @@ fn is_settings(query: &str) -> bool {
     query.trim().eq_ignore_ascii_case("/settings")
 }
 
+/// The scope a query's first word asks for, as the prefix its tab writes ("" for All),
+/// and the term after it. Reads the query the way search does: any case, any alias.
+fn scoped(query: &str) -> (&'static str, &str) {
+    if let Some(term) = crate::mail::query(query) {
+        return ("mail ", term);
+    }
+    let rest = query.trim_start();
+    match rest.find(char::is_whitespace) {
+        Some(end) if matches!(rest[..end].to_ascii_lowercase().as_str(), "excel" | "sheets" | "type:excel") => {
+            ("excel ", rest[end..].trim_start())
+        }
+        _ => ("", query),
+    }
+}
+
 /// Backdrop brightness as a byte.
 fn brightness(level: f32) -> u8 {
     (level * 255.0).round().clamp(0.0, 255.0) as u8
@@ -1785,7 +1814,7 @@ mod tests {
             scroll_to_selected: true,
             suppress_scroll_inertia: false,
             index: Arc::new(Index::default()),
-            history: win::History::default(),
+            history: Arc::default(),
             icons: HashMap::new(),
             icon_tx,
             icon_rx,
@@ -2263,6 +2292,56 @@ mod tests {
         assert_eq!(rows.at(0.0), 0);
         assert_eq!(rows.at(rows.top(2) + 1.0), 2);
         assert_eq!(rows.at(rows.total() + 100.0), 3, "beyond the end is the last row");
+    }
+
+    fn folder(name: &str) -> crate::library::Saved {
+        crate::library::Saved { name: name.into(), path: format!(r"C:\Work\{name}"), kind: Kind::Folder }
+    }
+
+    #[test]
+    fn tabs_read_the_scope_the_way_search_does() {
+        assert_eq!(scoped("excel budget"), ("excel ", "budget"));
+        assert_eq!(scoped("Sheets  q3 plan"), ("excel ", "q3 plan"));
+        assert_eq!(scoped("TYPE:EXCEL fy26"), ("excel ", "fy26"));
+        assert_eq!(scoped("Mail invoice"), ("mail ", "invoice"));
+        assert_eq!(scoped("email"), ("mail ", ""));
+        assert_eq!(scoped("excel"), ("", "excel"), "a scope word counts once a space follows it");
+        assert_eq!(scoped("budget excel q3"), ("", "budget excel q3"));
+    }
+
+    #[test]
+    fn a_header_row_on_a_one_row_display_scrolls_without_panicking() {
+        let mut app = launcher();
+        app.library.pins = vec![folder("Invoices"), folder("Budgets")];
+        app.query.clear();
+        app.refresh();
+        let ctx = ui_context();
+        assert_eq!(visible_result_rows(300.0), 1);
+        // The first row carries the "Pinned" header, so it is taller than the list.
+        ui_frame(&mut app, &ctx, 300.0, vec![]);
+        ui_frame(&mut app, &ctx, 300.0, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.selected, 1);
+        ui_frame(&mut app, &ctx, 300.0, vec![key(Key::ArrowUp, Modifiers::NONE)]);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_offset, HEADER_H, "the row, not its header, fills a one-row list");
+    }
+
+    #[test]
+    fn a_background_refresh_keeps_a_browsed_selection_in_commands_and_at_home() {
+        let mut app = launcher();
+        app.library.pins = vec![folder("Invoices"), folder("Budgets"), folder("Q3")];
+        for query in ["", "/pins", "/help"] {
+            app.query = query.into();
+            app.refresh();
+            app.select_result(2);
+            app.scroll_to_selected = false;
+            let title = app.results[2].title.clone();
+            app.last_query = None;
+            app.refresh(); // the index changed, or a window list arrived
+            assert_eq!(app.selected, 2, "{query:?}");
+            assert_eq!(app.results[app.selected].title, title, "{query:?}");
+            assert!(!app.scroll_to_selected, "{query:?}: an unmoved selection must not snap the list");
+        }
     }
 
     #[test]

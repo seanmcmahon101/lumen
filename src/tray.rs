@@ -119,7 +119,9 @@ unsafe fn menu(window: HWND, anchor: WPARAM) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let startup = if crate::win::startup_enabled() { MF_CHECKED } else { MF_UNCHECKED };
-        let _ = AppendMenuW(menu, MF_STRING, OPEN, w!("Open Lumen\tWin+Space"));
+        // The shortcut is a preference, so show the one currently set.
+        let open = windows::core::HSTRING::from(format!("Open Lumen\t{}", crate::settings::get().hotkey.label()));
+        let _ = AppendMenuW(menu, MF_STRING, OPEN, &open);
         let _ = AppendMenuW(menu, MF_STRING | startup, STARTUP, w!("Start at login"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, QUIT, w!("Quit Lumen"));
